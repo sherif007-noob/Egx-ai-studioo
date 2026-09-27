@@ -221,7 +221,6 @@ export default function App() {
   } | null>(null);
   const [historicalPriceSeries, setHistoricalPriceSeries] = useState<HistoricalPriceSeries>({});
   const [historicalAnalyticsLoading, setHistoricalAnalyticsLoading] = useState(false);
-  const marketRefresh = useMarketRefresh();
   const historicalBackfillAttemptsRef = useRef(new Set<string>());
 
   useEffect(() => {
@@ -241,34 +240,39 @@ export default function App() {
       try {
         let historicalPrices = await getHistoricalPricesForTransactions(transactions);
         let result = buildUnifiedAnalyticsResult(transactions, historicalPrices, 'ALL', {
-          openingCapital: analyticsCapitalDeposits,
+          openingCapital: capitalDeposits,
         });
 
-        const normalizeHistoryTicker = (ticker: string) =>
+        const normalizeTicker = (ticker: string) =>
           ticker.trim().toUpperCase().replace(/^EGX:/, '').replace(/\.CA$/, '');
 
         const repairTargets = result.dataQuality.missingTickers
-          .map(normalizeHistoryTicker)
+          .map((ticker) => normalizeTicker(ticker))
           .filter((ticker) => ticker && !historicalBackfillAttemptsRef.current.has(ticker))
-          .map((ticker) => ({
-            ticker,
-            startDate: transactions
-              .filter((tx) => normalizeHistoryTicker(tx.ticker) === ticker)
+          .map((ticker) => {
+            const startDate = transactions
+              .filter((tx) => normalizeTicker(tx.ticker) === ticker)
               .map((tx) => String(tx.date || '').slice(0, 10))
               .filter(Boolean)
-              .sort()[0],
-          }));
+              .sort()[0];
+            return { ticker, startDate };
+          });
 
         if (repairTargets.length) {
           for (const target of repairTargets) historicalBackfillAttemptsRef.current.add(target.ticker);
+
           try {
             const repair = await ensureHistoricalPriceCoverage(repairTargets);
             for (const failure of repair.failures) {
-              historicalBackfillAttemptsRef.current.delete(normalizeHistoryTicker(failure.ticker));
+              historicalBackfillAttemptsRef.current.delete(normalizeTicker(failure.ticker));
             }
+
+            // Re-read the canonical store after the server-side ingestion pass.
+            // This also handles the case where scheduled ingestion filled the rows
+            // between our first read and the repair request.
             historicalPrices = await getHistoricalPricesForTransactions(transactions);
             result = buildUnifiedAnalyticsResult(transactions, historicalPrices, 'ALL', {
-              openingCapital: analyticsCapitalDeposits,
+              openingCapital: capitalDeposits,
             });
           } catch (backfillError) {
             for (const target of repairTargets) historicalBackfillAttemptsRef.current.delete(target.ticker);

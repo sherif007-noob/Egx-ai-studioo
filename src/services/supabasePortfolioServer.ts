@@ -1,10 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 import { createChart, createSeries, createSession } from '@ch99q/twc';
-import { resolveTradingViewInstrument } from './tradingViewSymbolResolver';
 
 const SUPABASE_JWT_RETRY_DELAYS_MS = [300, 900, 1800];
 
 type HistoryBar = [number, number, number, number, number, number?];
+
+const HISTORICAL_TICKER_ALIASES: Record<string, string> = {
+  QNBA: 'QNBF',
+  MNHD: 'MASR',
+  AUTO: 'GBCO',
+  OTMT: 'OIH',
+  UBEG: 'UBEE',
+};
 
 function normalizeHistoryTicker(ticker: string): string {
   return String(ticker || '').trim().toUpperCase().replace(/^EGX:/, '').replace(/\.CA$/, '');
@@ -25,8 +32,6 @@ export interface HistoricalBackfillResult {
   writtenRows: number;
   failures: Array<{ ticker: string; error: string }>;
 }
-
-
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -319,6 +324,16 @@ export async function loadHistoricalPrices(uid: string, tickers: string[], start
 }
 
 
+/**
+ * Fill missing daily history for tickers that the analytics layer has already
+ * identified as incomplete. The client may provide a first-transaction date
+ * hint so a just-added trade can be repaired even if the accounting snapshot
+ * is still finishing its async persistence. When the ledger already contains
+ * the ticker, the persisted first-transaction date is authoritative.
+ *
+ * This function only writes market-data rows. It never mutates portfolio
+ * transactions, positions, cash, or closed trades.
+ */
 export async function ensurePortfolioHistoricalPrices(
   uid: string,
   requestedTargets: HistoricalBackfillTarget[],
@@ -374,7 +389,7 @@ export async function ensurePortfolioHistoricalPrices(
     };
   }
 
-  const session = await createTradingViewSession();
+  const session = await createSession();
   const backfilledTickers: string[] = [];
   const failures: Array<{ ticker: string; error: string }> = [];
   let writtenRows = 0;
@@ -402,18 +417,7 @@ export async function ensurePortfolioHistoricalPrices(
           (existingRows ?? []).map((row: any) => String(row.trading_date || '').slice(0, 10)),
         );
 
-        const { data: tickerMetaRow, error: tickerMetaError } = await supabase
-          .from('tickers')
-          .select('isin')
-          .eq('portfolio_id', portfolio.id)
-          .eq('ticker', ticker)
-          .maybeSingle();
-        if (tickerMetaError) throw new Error(`Ticker metadata read failed for ${ticker}: ${tickerMetaError.message}`);
-        const resolution = await resolveTradingViewInstrument(chart, {
-          ticker,
-          isin: String(tickerMetaRow?.isin || '').trim().toUpperCase() || undefined,
-        });
-        const resolved = resolution.resolved;
+        const resolved = await chart.resolve(HISTORICAL_TICKER_ALIASES[ticker] || ticker, 'EGX');
         const series = await createSeries(session, chart, resolved, '1D', requestedBars);
         try {
           const retrievedAt = new Date().toISOString();
@@ -467,156 +471,4 @@ export async function ensurePortfolioHistoricalPrices(
     writtenRows,
     failures,
   };
-}
-
-
-export interface IntradayBackfillResult {
-  requestedTickers: string[];
-  backfilledTickers: string[];
-  writtenRows: number;
-  failures: Array<{ ticker: string; error: string }>;
-}
-
-export async function ensurePortfolioIntradayPrices(
-  uid: string,
-  requestedTargets: HistoricalBackfillTarget[],
-): Promise<IntradayBackfillResult> {
-  const { supabase, portfolio } = await requirePortfolio(uid);
-  if (!portfolio) throw new Error('No Supabase portfolio exists for this authenticated user.');
-
-  const intervalMinutes = 5;
-  const today = new Date().toISOString().slice(0, 10);
-  const retentionStart = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
-  const requested = new Map<string, string | undefined>();
-  for (const target of requestedTargets.slice(0, 25)) {
-    const ticker = normalizeHistoryTicker(target?.ticker);
-    const hinted = String(target?.startDate || '').slice(0, 10);
-    if (!ticker || ticker === 'CASH') continue;
-    requested.set(ticker, /^\d{4}-\d{2}-\d{2}$/.test(hinted) ? hinted : undefined);
-  }
-  if (!requested.size) return { requestedTickers: [], backfilledTickers: [], writtenRows: 0, failures: [] };
-
-  const { data: txRows, error: txError } = await supabase
-    .from('transactions')
-    .select('ticker,transaction_date')
-    .eq('portfolio_id', portfolio.id)
-    .in('ticker', [...requested.keys()]);
-  if (txError) throw new Error(`Supabase transaction lookup failed for intraday backfill: ${txError.message}`);
-
-  const firstLedgerDate = new Map<string, string>();
-  for (const row of txRows ?? []) {
-    const ticker = normalizeHistoryTicker(String(row.ticker || ''));
-    const date = String(row.transaction_date || '').slice(0, 10);
-    if (!ticker || !/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
-    const previous = firstLedgerDate.get(ticker);
-    if (!previous || date < previous) firstLedgerDate.set(ticker, date);
-  }
-
-  const targets = [...requested.entries()].map(([ticker, hinted]) => ({
-    ticker,
-    startDate: [firstLedgerDate.get(ticker) ?? hinted ?? today, retentionStart].sort().at(-1)!,
-  }));
-
-  // Check coverage before opening TradingView. Most requests come from app startup,
-  // so already-covered tickers must not create WebSocket work.
-  const repairTargets: typeof targets = [];
-  const failures: Array<{ ticker: string; error: string }> = [];
-  for (const target of targets) {
-    const startIso = `${target.startDate}T00:00:00.000Z`;
-    const { data: coverage, error: coverageError } = await supabase
-      .from('intraday_price_history')
-      .select('bar_timestamp')
-      .eq('ticker', target.ticker)
-      .eq('interval_minutes', intervalMinutes)
-      .gte('bar_timestamp', startIso)
-      .order('bar_timestamp', { ascending: true })
-      .limit(1);
-    if (coverageError) {
-      failures.push({ ticker: target.ticker, error: `Existing intraday history read failed: ${coverageError.message}` });
-      continue;
-    }
-    const firstStored = coverage?.[0]?.bar_timestamp ? String(coverage[0].bar_timestamp) : null;
-    // A stored observation at/near the requested start means scheduled ingestion
-    // already established history for this ticker. Missing/new tickers continue.
-    if (firstStored && firstStored.slice(0, 10) <= target.startDate) continue;
-    repairTargets.push(target);
-  }
-
-  if (!repairTargets.length) {
-    return { requestedTickers: [...requested.keys()], backfilledTickers: [], writtenRows: 0, failures };
-  }
-
-  const session = await createTradingViewSession();
-  const backfilledTickers: string[] = [];
-  let writtenRows = 0;
-
-  try {
-    const chart = await createChart(session);
-    for (const { ticker, startDate } of repairTargets) {
-      try {
-        const startIso = `${startDate}T00:00:00.000Z`;
-        const firstStored: string | null = null;
-        const startMs = new Date(startIso).getTime();
-        const calendarDays = Math.max(1, Math.ceil((Date.now() - startMs) / 86_400_000) + 1);
-        const requestedBars = Math.min(7500, Math.max(256, Math.ceil(calendarDays * 5 / 7 + 5) * 66));
-
-        const { data: tickerMetaRow, error: tickerMetaError } = await supabase
-          .from('tickers')
-          .select('isin')
-          .eq('portfolio_id', portfolio.id)
-          .eq('ticker', ticker)
-          .maybeSingle();
-        if (tickerMetaError) throw new Error(`Ticker metadata read failed for ${ticker}: ${tickerMetaError.message}`);
-        const resolution = await resolveTradingViewInstrument(chart, {
-          ticker,
-          isin: String(tickerMetaRow?.isin || '').trim().toUpperCase() || undefined,
-        });
-        const resolved = resolution.resolved;
-        const series = await createSeries(session, chart, resolved, '5', requestedBars);
-        try {
-          const retrievedAt = new Date().toISOString();
-          const byTimestamp = new Map<string, any>();
-          for (const bar of (series.history || []) as HistoryBar[]) {
-            const timestamp = Number(bar[0]);
-            const close = Number(bar[4]);
-            if (!Number.isFinite(timestamp) || !Number.isFinite(close) || close <= 0) continue;
-            const barTimestamp = new Date(timestamp * 1000).toISOString();
-            if (barTimestamp < startIso || barTimestamp > new Date().toISOString()) continue;
-            byTimestamp.set(barTimestamp, {
-              ticker,
-              interval_minutes: intervalMinutes,
-              bar_timestamp: barTimestamp,
-              open: Number(bar[1]),
-              high: Number(bar[2]),
-              low: Number(bar[3]),
-              close,
-              volume: Number.isFinite(Number(bar[5])) ? Number(bar[5]) : null,
-              source: 'tradingview',
-              retrieved_at: retrievedAt,
-            });
-          }
-          const rows = [...byTimestamp.values()];
-          for (let offset = 0; offset < rows.length; offset += 500) {
-            const { error } = await supabase.from('intraday_price_history').upsert(rows.slice(offset, offset + 500), {
-              onConflict: 'ticker,interval_minutes,bar_timestamp',
-              ignoreDuplicates: false,
-            });
-            if (error) throw new Error(`Intraday history write failed: ${error.message}`);
-          }
-          if (rows.length && !firstStored) backfilledTickers.push(ticker);
-          writtenRows += rows.length;
-        } finally {
-          await series.close();
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        failures.push({ ticker, error: message });
-        console.error(`[Intraday backfill] ${ticker} failed:`, error);
-      }
-    }
-  } finally {
-    await session.close();
-  }
-
-  return { requestedTickers: [...requested.keys()], backfilledTickers, writtenRows, failures };
 }

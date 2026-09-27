@@ -66,14 +66,15 @@ export interface HistoricalBackfillResult {
 export async function ensureHistoricalPriceCoverage(
   targets: HistoricalBackfillTarget[],
 ): Promise<HistoricalBackfillResult> {
+  const normalizedTargets = targets
+    .map((target) => ({
+      ticker: normalizeTicker(target.ticker),
+      startDate: String(target.startDate || '').slice(0, 10) || undefined,
+    }))
+    .filter((target) => target.ticker && target.ticker !== 'CASH');
+
   const uniqueTargets = [...new Map(
-    targets
-      .map((target) => ({
-        ticker: normalizeTicker(target.ticker),
-        startDate: String(target.startDate || '').slice(0, 10) || undefined,
-      }))
-      .filter((target) => target.ticker && target.ticker !== 'CASH')
-      .map((target) => [target.ticker, target]),
+    normalizedTargets.map((target) => [target.ticker, target]),
   ).values()];
 
   if (!uniqueTargets.length) {
@@ -83,16 +84,24 @@ export async function ensureHistoricalPriceCoverage(
   const supabase = getSupabaseBrowserClient();
   const { data, error } = await supabase.auth.getSession();
   if (error) throw error;
+
   const token = data.session?.access_token;
   if (!token) throw new Error('Historical backfill requires an authenticated Supabase session.');
 
   const response = await fetch('/api/supabase/price-history/ensure', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({ targets: uniqueTargets }),
   });
+
   const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(payload?.error || `Historical backfill request failed with HTTP ${response.status}.`);
+  if (!response.ok) {
+    throw new Error(payload?.error || `Historical backfill request failed with HTTP ${response.status}.`);
+  }
+
   return payload?.data ?? {
     requestedTickers: uniqueTargets.map((target) => target.ticker),
     backfilledTickers: [],

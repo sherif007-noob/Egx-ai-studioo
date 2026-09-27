@@ -60,6 +60,12 @@ async function startServer() {
     return { data: await ensurePortfolioIntradayPrices(uid, targets) };
   }));
 
+  app.post("/api/supabase/price-history/ensure", (req, res) => withSupabaseUser(req, res, async (uid) => {
+    const targets = Array.isArray(req.body?.targets) ? req.body.targets : [];
+    if (!targets.length) throw new Error("At least one historical backfill target is required.");
+    return { data: await ensurePortfolioHistoricalPrices(uid, targets) };
+  }));
+
   app.post("/api/migration/firestore-to-supabase", async (req, res) => {
     if (process.env.ENABLE_SUPABASE_MIGRATION_UI !== "true") return res.status(404).json({ error: "Migration endpoint is disabled." });
     if (migrationCompleted) return res.status(409).json({ error: "This server instance has already completed the migration." });
