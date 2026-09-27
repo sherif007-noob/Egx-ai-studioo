@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   FileSpreadsheet, 
   PlusCircle, 
@@ -7,29 +8,60 @@ import {
   BarChart3, 
   BookOpen, 
   ListOrdered,
-  LogOut,
-  User as UserIcon,
   Check,
   RefreshCw,
   Wallet,
   RotateCcw,
-  Sparkles,
   Zap,
   Database,
   AlertTriangle,
   Bell,
   BellRing,
-  LogIn,
+  Settings2,
+  ChevronDown,
 } from 'lucide-react';
-import { User } from 'firebase/auth';
 
 export type NavigationTab = 'overview' | 'positions' | 'closed_cycles' | 'journal' | 'cash' | 'reports' | 'directory';
+
+const NAV_GROUPS = [
+  {
+    label: 'Portfolio',
+    items: [
+      { tab: 'overview', id: 'tab-overview', label: 'Overview', compactLabel: 'Overview', icon: TrendingUp, accent: '16 185 129' },
+      { tab: 'positions', id: 'tab-positions', label: 'Open Positions', compactLabel: 'Positions', icon: Layers, accent: '59 130 246' },
+      { tab: 'closed_cycles', id: 'tab-closed-cycles', label: 'Closed Cycles', compactLabel: 'Cycles', icon: RotateCcw, accent: '168 85 247' },
+    ],
+  },
+  {
+    label: 'Activity',
+    items: [
+      { tab: 'journal', id: 'tab-transactions', label: 'Transactions', compactLabel: 'Transactions', icon: BookOpen, accent: '245 158 11' },
+      { tab: 'cash', id: 'tab-cash-ledger', label: 'Cash Ledger', compactLabel: 'Cash', icon: Wallet, accent: '245 158 11' },
+    ],
+  },
+  {
+    label: 'Insights',
+    items: [
+      { tab: 'reports', id: 'tab-reports', label: 'Reports & Performance', compactLabel: 'Reports', icon: BarChart3, accent: '168 85 247' },
+      { tab: 'directory', id: 'tab-directory', label: 'Stocks & Prices', compactLabel: 'Stocks', icon: ListOrdered, accent: '20 184 166' },
+    ],
+  },
+] as const satisfies ReadonlyArray<{
+  label: string;
+  items: ReadonlyArray<{
+    tab: NavigationTab;
+    id: string;
+    label: string;
+    compactLabel: string;
+    icon: React.ComponentType<{ className?: string }>;
+    accent: string;
+  }>;
+}>;
 
 interface HeaderProps {
   activeTab: NavigationTab;
   setActiveTab: (tab: NavigationTab) => void;
   onOpenGoogleSheets: () => void;
-  onOpenSchemaSync?: () => void;
   onOpenAddTrade: () => void;
   onOpenBackupModal?: () => void;
   onOpenScreenshotModal?: () => void;
@@ -37,21 +69,16 @@ interface HeaderProps {
   unreadAlertCount?: number;
   isAlertsActive?: boolean;
   isSheetsConnected: boolean;
-  sheetsTitle?: string;
   isTokenExpired?: boolean;
-  authUser: User | null;
-  onLogin?: () => Promise<any>;
-  onLogout: () => void;
   onSyncLivePrices?: () => void;
   isSyncingPrices?: boolean;
-  forceSyncToFirestore?: () => Promise<boolean>;
+  onOpenSettings?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
   setActiveTab,
   onOpenGoogleSheets,
-  onOpenSchemaSync,
   onOpenAddTrade,
   onOpenBackupModal,
   onOpenScreenshotModal,
@@ -59,107 +86,267 @@ export const Header: React.FC<HeaderProps> = ({
   unreadAlertCount = 0,
   isAlertsActive = true,
   isSheetsConnected,
-  sheetsTitle,
   isTokenExpired = false,
-  authUser,
-  onLogin,
-  onLogout,
   onSyncLivePrices,
   isSyncingPrices = false,
-  forceSyncToFirestore,
+  onOpenSettings,
 }) => {
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'success' | 'error'>('idle');
+  const navScrollRef = useRef<HTMLDivElement>(null);
+  const dataToolsRef = useRef<HTMLDivElement>(null);
+  const dataToolsMenuRef = useRef<HTMLDivElement>(null);
+  const [isDataToolsOpen, setIsDataToolsOpen] = useState(false);
+  const [dataToolsMenuGeometry, setDataToolsMenuGeometry] = useState<{
+    left: number;
+    top: number;
+    width: number;
+  } | null>(null);
+  const [canScrollNavLeft, setCanScrollNavLeft] = useState(false);
+  const [canScrollNavRight, setCanScrollNavRight] = useState(false);
 
-  const handleForceSync = async () => {
-    if (syncStatus === 'syncing' || !forceSyncToFirestore) return;
+  const updateNavOverflow = useCallback(() => {
+    const container = navScrollRef.current;
+    if (!container) return;
+    const tolerance = 2;
+    setCanScrollNavLeft(container.scrollLeft > tolerance);
+    setCanScrollNavRight(
+      container.scrollLeft + container.clientWidth < container.scrollWidth - tolerance,
+    );
+  }, []);
 
-    if (!authUser && onLogin) {
-      try {
-        setSyncStatus('syncing');
-        const loginRes = await onLogin();
-        if (loginRes?.user) {
-          const success = await forceSyncToFirestore();
-          setSyncStatus(success ? 'success' : 'error');
-          setTimeout(() => setSyncStatus('idle'), 3000);
-          return;
-        }
-      } catch (err) {
-        console.warn('Sign-in on force sync cancelled or failed:', err);
-        setSyncStatus('error');
-        setTimeout(() => setSyncStatus('idle'), 4000);
-        return;
+  useEffect(() => {
+    const container = navScrollRef.current;
+    if (!container) return;
+
+    updateNavOverflow();
+    const observer = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(updateNavOverflow)
+      : null;
+    observer?.observe(container);
+    window.addEventListener('resize', updateNavOverflow);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateNavOverflow);
+    };
+  }, [updateNavOverflow]);
+
+  const updateDataToolsMenuGeometry = useCallback(() => {
+    const trigger = dataToolsRef.current;
+    if (!trigger || typeof window === 'undefined') return;
+
+    const rect = trigger.getBoundingClientRect();
+    const gutter = 12;
+    const visualViewport = window.visualViewport;
+    const viewportLeft = visualViewport?.offsetLeft ?? 0;
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const viewportWidth = visualViewport?.width ?? window.innerWidth;
+    const viewportHeight = visualViewport?.height ?? window.innerHeight;
+    const viewportRight = viewportLeft + viewportWidth;
+
+    const safeHost = trigger.closest<HTMLElement>('.premium-safe-inline-header');
+    const safeHostRect = safeHost?.getBoundingClientRect();
+    const safeHostStyle = safeHost ? window.getComputedStyle(safeHost) : null;
+    const safeLeft = safeHostRect
+      ? Math.max(
+          viewportLeft + gutter,
+          safeHostRect.left + Number.parseFloat(safeHostStyle?.paddingLeft ?? '0'),
+        )
+      : viewportLeft + gutter;
+    const safeRight = safeHostRect
+      ? Math.min(
+          viewportRight - gutter,
+          safeHostRect.right - Number.parseFloat(safeHostStyle?.paddingRight ?? '0'),
+        )
+      : viewportRight - gutter;
+
+    const availableWidth = Math.max(0, safeRight - safeLeft);
+    const width = Math.min(304, availableWidth);
+    const preferredLeft = rect.right - width;
+    const maxLeft = Math.max(safeLeft, safeRight - width);
+    const left = Math.min(maxLeft, Math.max(safeLeft, preferredLeft));
+    const estimatedMenuHeight = 148;
+    const preferredTop = rect.bottom + 8;
+    const top = Math.min(
+      preferredTop,
+      Math.max(viewportTop + gutter, viewportTop + viewportHeight - gutter - estimatedMenuHeight),
+    );
+
+    setDataToolsMenuGeometry({ left, top, width });
+  }, []);
+
+  useEffect(() => {
+    if (!isDataToolsOpen) return;
+
+    updateDataToolsMenuGeometry();
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      const clickedTrigger = dataToolsRef.current?.contains(target) ?? false;
+      const clickedMenu = dataToolsMenuRef.current?.contains(target) ?? false;
+      if (!clickedTrigger && !clickedMenu) {
+        setIsDataToolsOpen(false);
       }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsDataToolsOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', updateDataToolsMenuGeometry);
+    window.visualViewport?.addEventListener('resize', updateDataToolsMenuGeometry);
+    window.visualViewport?.addEventListener('scroll', updateDataToolsMenuGeometry);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', updateDataToolsMenuGeometry);
+      window.visualViewport?.removeEventListener('resize', updateDataToolsMenuGeometry);
+      window.visualViewport?.removeEventListener('scroll', updateDataToolsMenuGeometry);
+    };
+  }, [isDataToolsOpen, updateDataToolsMenuGeometry]);
+
+  const scrollNavItemIntoView = useCallback((
+    item: HTMLElement | null,
+    behavior: ScrollBehavior,
+  ) => {
+    const container = navScrollRef.current;
+    if (!container || !item) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    const edgePadding = 24;
+    const compactViewport = container.clientWidth < 640;
+    let nextLeft = container.scrollLeft;
+
+    if (compactViewport) {
+      const itemCenter =
+        container.scrollLeft
+        + (itemRect.left - containerRect.left)
+        + itemRect.width / 2;
+      nextLeft = itemCenter - container.clientWidth / 2;
+    } else if (itemRect.left < containerRect.left + edgePadding) {
+      nextLeft += itemRect.left - containerRect.left - edgePadding;
+    } else if (itemRect.right > containerRect.right - edgePadding) {
+      nextLeft += itemRect.right - containerRect.right + edgePadding;
+    } else {
+      return;
     }
 
-    setSyncStatus('syncing');
-    try {
-      const success = await forceSyncToFirestore();
-      if (success) {
-        setSyncStatus('success');
-        setTimeout(() => setSyncStatus('idle'), 3000);
-      } else {
-        setSyncStatus('error');
-        setTimeout(() => setSyncStatus('idle'), 4000);
-      }
-    } catch (err) {
-      console.error('Manual sync failed:', err);
-      setSyncStatus('error');
-      setTimeout(() => setSyncStatus('idle'), 4000);
-    }
+    const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+    container.scrollTo({
+      left: Math.min(maxLeft, Math.max(0, nextLeft)),
+      behavior,
+    });
+  }, []);
+
+  useEffect(() => {
+    const container = navScrollRef.current;
+    if (!container) return;
+    const active = container.querySelector<HTMLElement>('[aria-current="page"]');
+    const reduceMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    scrollNavItemIntoView(active, reduceMotion ? 'auto' : 'smooth');
+    window.requestAnimationFrame(updateNavOverflow);
+  }, [activeTab, scrollNavItemIntoView, updateNavOverflow]);
+
+  const handleNavKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+
+    const tabs = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[data-nav-tab="true"]'),
+    );
+    const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (currentIndex < 0 || tabs.length === 0) return;
+
+    event.preventDefault();
+
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+    if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    if (event.key === 'Home') nextIndex = 0;
+    if (event.key === 'End') nextIndex = tabs.length - 1;
+
+    const nextTab = tabs[nextIndex];
+    nextTab?.focus();
+    scrollNavItemIntoView(nextTab ?? null, 'auto');
   };
+
   return (
-    <header className="sticky top-0 z-40 w-full border-b border-slate-800/80 bg-slate-950/90 backdrop-blur-md">
+    <header className="premium-header sticky top-0 z-40 w-full border-b">
       {/* Top Bar */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex flex-wrap items-center justify-between min-h-[4rem] py-2 gap-y-3 gap-x-2">
+      <div className="premium-safe-inline-header premium-header-safe-top max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+        <div className="premium-header-top-row flex flex-wrap items-center justify-between min-h-[4rem] py-2 gap-y-2.5 gap-x-2">
           
           {/* Brand Logo & Title */}
-          <div className="flex items-center gap-3 shrink-0">
-            <div className="relative w-10 h-10 rounded-xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/80 flex items-center justify-center p-1.5 shadow-md shadow-black/50 shrink-0">
+          <div className="premium-header-brand flex min-w-0 shrink-0 items-center gap-3">
+            <div className="premium-header-logo premium-inset-glass relative w-10 h-10 rounded-xl flex items-center justify-center p-1.5 shrink-0">
               <img src="/icon.svg" alt="EGX Logo" className="w-full h-full object-contain" />
-              <span className="absolute -bottom-1 -right-1 flex h-3 w-3">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-              </span>
+              <span className="absolute -bottom-1 -right-1 inline-flex h-3 w-3 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.32)]" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-base sm:text-lg font-bold text-white tracking-tight">
                   EGX Portfolio
                 </h1>
-                <span className="hidden md:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                <span className="premium-header-market-badge hidden md:inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
                   EGX Equities • EGP
                 </span>
               </div>
-              <p className="text-[11px] text-slate-400 hidden sm:block">
+              <p className="premium-header-subtitle text-[11px] text-slate-400 hidden sm:block">
                 Live Prices, Analytics &amp; Automated Schema Sync
               </p>
             </div>
           </div>
 
-          {/* Action Buttons */}
-          <div className="flex items-center flex-wrap justify-end gap-1.5 sm:gap-2.5 flex-1 min-w-[200px]">
+          {/* Phase 9 command zone: utilities are grouped separately from creation actions. */}
+          <div className="premium-header-action-rail premium-header-command-zone flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1 sm:justify-end">
+            <div
+              className="premium-header-utility-scroller min-w-0 flex-1 overflow-x-auto overscroll-x-contain scrollbar-none sm:flex-none sm:overflow-visible"
+              role="group"
+              aria-label="Quick utilities"
+            >
+              <div className="premium-header-utility-cluster flex w-max items-center gap-1 rounded-xl p-1 sm:gap-1.5">
             {/* Price Target & Push Notifications Trigger */}
             {onOpenPriceAlerts && (
               <button
                 id="header-price-alerts-btn"
                 onClick={onOpenPriceAlerts}
-                className="relative flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-slate-200 border border-slate-700 hover:bg-slate-800 hover:border-amber-500/50 transition group"
+                aria-label={
+                  unreadAlertCount > 0
+                    ? `Price Alerts — ${unreadAlertCount} unread`
+                    : isAlertsActive
+                    ? 'Price Alerts — active'
+                    : 'Price Alerts — paused'
+                }
+                data-status={unreadAlertCount > 0 ? 'attention' : isAlertsActive ? 'active' : 'paused'}
+                className={`premium-action premium-header-action premium-header-action-amber relative flex shrink-0 items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold group sm:px-3 ${
+                  unreadAlertCount > 0 ? 'premium-header-action-attention' : ''
+                }`}
                 title="Price Target Web Push Notifications & Alerts"
               >
                 {unreadAlertCount > 0 ? (
-                  <BellRing className="w-3.5 h-3.5 text-amber-400 animate-bounce" />
+                  <BellRing className="h-3.5 w-3.5 text-amber-300" />
                 ) : (
-                  <Bell className="w-3.5 h-3.5 text-slate-400 group-hover:text-amber-400 transition" />
+                  <Bell className="h-3.5 w-3.5 text-amber-300/80 transition group-hover:text-amber-200" />
                 )}
-                <span className="hidden lg:inline">Price Alerts</span>
+                <span className="premium-header-action-label hidden lg:inline">Price Alerts</span>
                 {unreadAlertCount > 0 ? (
-                  <span className="inline-flex items-center justify-center px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-500 text-slate-950 font-mono">
+                  <span className="premium-header-status-badge premium-header-status-badge-amber">
                     {unreadAlertCount}
                   </span>
-                ) : isAlertsActive ? (
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 hidden sm:inline-block" title="Alerts active" />
-                ) : null}
+                ) : (
+                  <span
+                    className={`premium-header-status-dot ${
+                      isAlertsActive
+                        ? 'premium-header-status-dot-connected'
+                        : 'premium-header-status-dot-muted'
+                    }`}
+                    title={isAlertsActive ? 'Alerts active' : 'Alerts paused'}
+                    aria-hidden="true"
+                  />
+                )}
               </button>
             )}
 
@@ -169,97 +356,178 @@ export const Header: React.FC<HeaderProps> = ({
                 id="header-live-sync-btn"
                 onClick={onSyncLivePrices}
                 disabled={isSyncingPrices}
-                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-300 border border-cyan-500/40 transition hover:border-cyan-400 disabled:opacity-50"
+                aria-label={isSyncingPrices ? 'Sync Prices — syncing now' : 'Sync Prices'}
+                data-status={isSyncingPrices ? 'running' : 'idle'}
+                className={`premium-action premium-header-action premium-header-action-cyan relative flex shrink-0 items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-100 sm:px-3 ${
+                  isSyncingPrices ? 'premium-header-action-running' : ''
+                }`}
                 title="Sync live EGX prices from TradingView Egypt Scanner"
               >
-                <RefreshCw className={`w-3.5 h-3.5 text-cyan-400 ${isSyncingPrices ? 'animate-spin' : ''}`} />
-                <span className="hidden md:inline">{isSyncingPrices ? 'Syncing...' : 'Sync Prices'}</span>
-              </button>
-            )}
-
-            {/* Google Sheets Trigger */}
-            <button
-              id="header-google-sheets-btn"
-              onClick={onOpenGoogleSheets}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
-                isTokenExpired
-                  ? 'bg-amber-950/50 text-amber-300 border-amber-500/50 hover:bg-amber-900/50 animate-pulse'
-                  : isSheetsConnected
-                  ? 'bg-emerald-950/40 text-emerald-300 border-emerald-600/40 hover:bg-emerald-900/40'
-                  : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800 hover:text-white'
-              }`}
-              title={isTokenExpired ? 'Google Sheets token expired. Click to reconnect' : 'Connect or sync Google Sheets'}
-            >
-              {isTokenExpired ? (
-                <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-              ) : (
-                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
-              )}
-              <span className="hidden md:inline">
-                {isTokenExpired ? 'Reconnect Sheets' : isSheetsConnected ? 'Sheets Synced' : 'Google Sheets'}
-              </span>
-              {isSheetsConnected && !isTokenExpired && <Check className="w-3 h-3 text-emerald-400 ml-0.5" />}
-            </button>
-
-            {/* Force Sync Firebase Button */}
-            {forceSyncToFirestore && (
-              <button
-                id="header-force-sync-btn"
-                onClick={handleForceSync}
-                disabled={syncStatus === 'syncing'}
-                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold border transition active:scale-95 ${
-                  syncStatus === 'syncing'
-                    ? 'bg-amber-950/60 text-amber-300 border-amber-500/50 cursor-wait'
-                    : syncStatus === 'success'
-                    ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/50'
-                    : syncStatus === 'error'
-                    ? 'bg-rose-950/60 text-rose-300 border-rose-500/50'
-                    : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800 hover:text-white'
-                }`}
-                title="Force bidirectional sync with Firebase (pulls newest trades from phone & pushes local updates)"
-              >
-                {syncStatus === 'syncing' ? (
-                  <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
-                ) : syncStatus === 'success' ? (
-                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                ) : (
-                  <Database className="w-3.5 h-3.5 text-amber-400" />
-                )}
-                <span className="hidden sm:inline">
-                  {syncStatus === 'syncing'
-                    ? 'Syncing...'
-                    : syncStatus === 'success'
-                    ? 'Synced!'
-                    : syncStatus === 'error'
-                    ? 'Sync Failed'
-                    : 'Force Sync'}
+                <RefreshCw className={`h-3.5 w-3.5 text-cyan-300 ${isSyncingPrices ? 'animate-spin' : ''}`} />
+                <span className="premium-header-action-label hidden md:inline">
+                  {isSyncingPrices ? 'Syncing...' : 'Sync Prices'}
                 </span>
+                {isSyncingPrices && (
+                  <span className="premium-header-status-dot premium-header-status-dot-running" aria-hidden="true" />
+                )}
               </button>
             )}
 
-            {/* Offline Backup & Ledger Reconcile Modal Trigger */}
-            {onOpenBackupModal && (
+            </div>
+            </div>
+
+            <div
+              className="premium-header-data-cluster flex shrink-0 items-center gap-1 rounded-xl p-1"
+              role="group"
+              aria-label="Data and settings"
+            >
+              {/* Data management: lower-frequency tools share one premium command. */}
+              <div ref={dataToolsRef} className="premium-header-tools relative shrink-0">
+                <button
+                  id="header-data-tools-btn"
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-expanded={isDataToolsOpen}
+                  onClick={() => {
+                    const nextOpen = !isDataToolsOpen;
+                    if (nextOpen) updateDataToolsMenuGeometry();
+                    setIsDataToolsOpen(nextOpen);
+                  }}
+                  data-status={isTokenExpired ? 'attention' : isSheetsConnected ? 'connected' : 'idle'}
+                  className={`premium-action premium-header-action premium-header-tools-trigger relative flex shrink-0 items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold sm:px-3 ${
+                    isTokenExpired
+                      ? 'premium-header-action-amber premium-header-action-attention'
+                      : 'premium-header-action-purple'
+                  }`}
+                  title="Google Sheets, backup, restore, and ledger reconciliation"
+                >
+                  <Database className="h-3.5 w-3.5 text-purple-300" />
+                  <span className="premium-header-action-label hidden lg:inline">Data &amp; Tools</span>
+                  <ChevronDown className={`premium-motion-chevron h-3.5 w-3.5 text-purple-300/80 ${isDataToolsOpen ? 'rotate-180' : ''}`} />
+                  {isTokenExpired ? (
+                    <span
+                      className="premium-header-status-dot premium-header-status-dot-warning"
+                      title="Google Sheets needs reconnection"
+                      aria-label="Google Sheets needs reconnection"
+                    />
+                  ) : isSheetsConnected ? (
+                    <span
+                      className="premium-header-status-dot premium-header-status-dot-connected"
+                      title="Google Sheets connected"
+                      aria-label="Google Sheets connected"
+                    />
+                  ) : null}
+                </button>
+
+                {isDataToolsOpen &&
+                  dataToolsMenuGeometry &&
+                  typeof document !== 'undefined' &&
+                  createPortal(
+                    <div
+                      ref={dataToolsMenuRef}
+                      id="header-data-tools-menu"
+                      role="menu"
+                      aria-label="Data and tools"
+                      className="premium-floating premium-dropdown premium-header-tools-menu fixed z-[80] max-h-[min(70dvh,24rem)] overflow-y-auto overflow-x-hidden rounded-xl border p-1.5"
+                      style={{
+                        left: dataToolsMenuGeometry.left,
+                        top: dataToolsMenuGeometry.top,
+                        width: dataToolsMenuGeometry.width,
+                      }}
+                    >
+                      <button
+                        id="header-google-sheets-btn"
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setIsDataToolsOpen(false);
+                          onOpenGoogleSheets();
+                        }}
+                        className={`premium-menu-item premium-header-tools-item flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left ${
+                          isTokenExpired ? 'premium-header-tools-item-warning' : 'premium-header-tools-item-emerald'
+                        }`}
+                      >
+                        <span className="premium-header-tools-icon-wrap">
+                          {isTokenExpired ? (
+                            <AlertTriangle className="h-4 w-4 text-amber-300" />
+                          ) : (
+                            <FileSpreadsheet className="h-4 w-4 text-emerald-300" />
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-xs font-semibold text-slate-100">
+                            {isTokenExpired ? 'Reconnect Google Sheets' : 'Google Sheets'}
+                          </span>
+                          <span className="mt-0.5 block text-[10px] leading-4 text-slate-500">
+                            {isTokenExpired
+                              ? 'Authentication expired — reconnect to continue sync'
+                              : isSheetsConnected
+                              ? 'Connected — manage or sync spreadsheet data'
+                              : 'Connect portfolio data to Google Sheets'}
+                          </span>
+                        </span>
+                        {isSheetsConnected && !isTokenExpired && (
+                          <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                        )}
+                      </button>
+
+                      {onOpenBackupModal && (
+                        <button
+                          id="header-backup-reconcile-btn"
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setIsDataToolsOpen(false);
+                            onOpenBackupModal();
+                          }}
+                          className="premium-menu-item premium-header-tools-item premium-header-tools-item-purple flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left"
+                        >
+                          <span className="premium-header-tools-icon-wrap">
+                            <Database className="h-4 w-4 text-purple-300" />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block text-xs font-semibold text-slate-100">Backup &amp; Reconcile</span>
+                            <span className="mt-0.5 block text-[10px] leading-4 text-slate-500">
+                              Backup, restore, or reconcile against the ledger
+                            </span>
+                          </span>
+                        </button>
+                      )}
+                    </div>,
+                    document.body,
+                  )}
+              </div>
+
+              {/* Settings entry point is reserved for future functionality; Phase 9 adds the affordance only. */}
               <button
-                id="header-backup-reconcile-btn"
-                onClick={onOpenBackupModal}
-                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-slate-300 border border-slate-700 hover:bg-slate-800 hover:text-white transition"
-                title="Backup JSON, restore database, or reconcile portfolio ledger"
+                id="header-settings-btn"
+                onClick={onOpenSettings}
+                aria-label="Settings"
+                className="premium-action premium-header-action premium-header-action-neutral premium-header-utility-action flex shrink-0 items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold"
+                title="Settings — reserved for a future phase"
               >
-                <Database className="w-3.5 h-3.5 text-purple-400" />
-                <span className="hidden lg:inline">Backup &amp; Reconcile</span>
+                <Settings2 className="h-3.5 w-3.5 text-slate-300" />
+                <span className="premium-header-action-label hidden 2xl:inline">Settings</span>
               </button>
-            )}
+            </div>
 
+            <div
+              className="premium-header-create-cluster flex shrink-0 items-center gap-1 p-1 sm:gap-1.5"
+              role="group"
+              aria-label="Create trade"
+            >
             {/* Scan Screenshot Button */}
             {onOpenScreenshotModal && (
               <button
                 id="header-scan-btn"
                 onClick={onOpenScreenshotModal}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-md shadow-emerald-900/30 transition active:scale-95"
+                aria-label="Scan receipt to add trade"
+                data-action-priority="creation-secondary"
+                className="premium-action premium-action-success premium-header-create-secondary flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
                 title="Upload trade screenshot or receipt to scan and log"
               >
                 <Zap className="w-3.5 h-3.5 text-emerald-200" />
-                <span className="hidden lg:inline">Scan Receipt</span>
+                <span className="premium-header-action-label hidden lg:inline">Scan Receipt</span>
               </button>
             )}
 
@@ -267,152 +535,90 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               id="header-add-trade-btn"
               onClick={onOpenAddTrade}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs sm:text-sm font-semibold shadow-md shadow-blue-900/30 transition active:scale-95"
+              aria-label="Add trade"
+              data-action-priority="creation-primary"
+              className="premium-action premium-action-primary premium-shimmer-border premium-header-create-primary flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold"
             >
               <PlusCircle className="w-4 h-4 shrink-0" />
-              <span className="hidden sm:inline">Add Trade</span>
+              <span className="premium-header-action-label hidden sm:inline">Add Trade</span>
             </button>
-
-            {/* User Profile / Auth */}
-            {authUser ? (
-              <div className="flex items-center gap-1.5 pl-1.5 border-l border-slate-800 shrink-0">
-                <div 
-                  className="w-7 h-7 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 text-xs overflow-hidden ring-1 ring-emerald-500/40"
-                  title={`Signed in: ${authUser.email || 'User'} (Cloud Synced)`}
-                >
-                  {authUser.photoURL ? (
-                    <img src={authUser.photoURL} alt="Avatar" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                  ) : (
-                    <UserIcon className="w-3.5 h-3.5" />
-                  )}
-                </div>
-                <button
-                  id="logout-btn"
-                  onClick={onLogout}
-                  className="p-1 rounded-md text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition"
-                  title="Sign out"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ) : onLogin ? (
-              <button
-                id="header-login-btn"
-                onClick={async () => {
-                  try {
-                    await onLogin();
-                    if (forceSyncToFirestore) {
-                      setTimeout(() => forceSyncToFirestore(), 800);
-                    }
-                  } catch (e) {
-                    console.error('Login error:', e);
-                  }
-                }}
-                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/50 transition active:scale-95 shrink-0"
-                title="Sign in with Google to enable Firebase Cloud Sync across your devices"
-              >
-                <LogIn className="w-3.5 h-3.5 text-blue-400" />
-                <span>Sign In</span>
-              </button>
-            ) : null}
+            </div>
           </div>
         </div>
       </div>
 
       {/* Navigation Tabs Bar */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 border-t border-slate-800/60 overflow-x-auto scrollbar-none">
-        <nav className="flex space-x-1 sm:space-x-3 py-2 min-w-max">
-          <button
-            id="tab-overview"
-            onClick={() => setActiveTab('overview')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'overview'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-            }`}
+      <div className="premium-nav-shell relative border-t border-slate-700/40 bg-slate-950/15">
+        <div className="premium-safe-inline-header relative mx-auto max-w-7xl px-3 sm:px-6 lg:px-8">
+          <div
+            ref={navScrollRef}
+            onScroll={updateNavOverflow}
+            className="premium-nav-scroller overflow-x-auto overscroll-x-contain scrollbar-none"
           >
-            <TrendingUp className="w-4 h-4 text-emerald-400" />
-            Overview
-          </button>
+            <nav
+              className="premium-header-nav-row flex min-w-max items-center gap-1 py-2"
+              aria-label="Portfolio navigation"
+              onKeyDown={handleNavKeyDown}
+            >
+              {NAV_GROUPS.map((group, groupIndex) => (
+                <React.Fragment key={group.label}>
+                  {groupIndex > 0 && (
+                    <span
+                      className="premium-nav-divider mx-1 h-5 w-px shrink-0 sm:mx-2"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <div
+                    className="premium-nav-group flex items-center gap-1 sm:gap-1.5"
+                    role="group"
+                    aria-label={group.label}
+                  >
+                    <span className="premium-nav-group-label hidden 2xl:inline-flex px-1.5 text-[9px] font-semibold uppercase tracking-[0.12em]">
+                      {group.label}
+                    </span>
+                    {group.items.map((item) => {
+                      const Icon = item.icon;
+                      const active = activeTab === item.tab;
+                      return (
+                        <button
+                          key={item.tab}
+                          id={item.id}
+                          aria-current={active ? 'page' : undefined}
+                          aria-label={item.label}
+                          data-nav-tab="true"
+                          onClick={() => setActiveTab(item.tab)}
+                          className={`premium-nav premium-nav-item flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium sm:gap-2 sm:px-3 sm:text-sm ${
+                            active
+                              ? 'premium-nav-active text-white font-semibold'
+                              : 'premium-nav-idle'
+                          }`}
+                          style={{ '--premium-nav-accent': item.accent } as React.CSSProperties}
+                        >
+                          <Icon className="premium-nav-icon h-4 w-4" />
+                          <span className="premium-nav-label-compact 2xl:hidden">{item.compactLabel}</span>
+                          <span className="premium-nav-label-full hidden 2xl:inline">{item.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </React.Fragment>
+              ))}
+            </nav>
+          </div>
 
-          <button
-            id="tab-positions"
-            onClick={() => setActiveTab('positions')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'positions'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+          <div
+            className={`premium-nav-edge premium-nav-edge-left pointer-events-none absolute inset-y-0 left-0 w-10 transition-opacity duration-200 ${
+              canScrollNavLeft ? 'opacity-100' : 'opacity-0'
             }`}
-          >
-            <Layers className="w-4 h-4 text-blue-400" />
-            Open Positions
-          </button>
-
-          <button
-            id="tab-closed-cycles"
-            onClick={() => setActiveTab('closed_cycles')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'closed_cycles'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            aria-hidden="true"
+          />
+          <div
+            className={`premium-nav-edge premium-nav-edge-right pointer-events-none absolute inset-y-0 right-0 w-10 transition-opacity duration-200 ${
+              canScrollNavRight ? 'opacity-100' : 'opacity-0'
             }`}
-          >
-            <RotateCcw className="w-4 h-4 text-purple-400" />
-            Closed Cycles
-          </button>
-
-          <button
-            id="tab-transactions"
-            onClick={() => setActiveTab('journal')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'journal'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-            }`}
-          >
-            <BookOpen className="w-4 h-4 text-amber-400" />
-            Transactions
-          </button>
-
-          <button
-            id="tab-cash-ledger"
-            onClick={() => setActiveTab('cash')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'cash'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-            }`}
-          >
-            <Wallet className="w-4 h-4 text-amber-400" />
-            Cash Ledger
-          </button>
-
-          <button
-            id="tab-reports"
-            onClick={() => setActiveTab('reports')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'reports'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-            }`}
-          >
-            <BarChart3 className="w-4 h-4 text-purple-400" />
-            Reports and performance
-          </button>
-
-          <button
-            id="tab-directory"
-            onClick={() => setActiveTab('directory')}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition ${
-              activeTab === 'directory'
-                ? 'bg-slate-800 text-white font-semibold shadow-inner border border-slate-700'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-            }`}
-          >
-            <ListOrdered className="w-4 h-4 text-teal-400" />
-            Stocks &amp; Prices
-          </button>
-        </nav>
+            aria-hidden="true"
+          />
+        </div>
       </div>
     </header>
   );

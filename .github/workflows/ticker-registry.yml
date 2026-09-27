@@ -1,0 +1,83 @@
+name: EGX Ticker Registry
+
+on:
+  push:
+    branches:
+      - feature/premium-ui-redesign
+    paths:
+      - '.github/workflows/ticker-registry.yml'
+      - 'scripts/syncTickerRegistry.ts'
+      - 'src/services/tickerRegistry.ts'
+      - 'src/services/tickerRegistry.test.ts'
+      - 'src/services/tradingViewSymbolResolver.ts'
+      - 'src/data/egxTickers.ts'
+      - 'supabase/migrations/20260924_ticker_registry*.sql'
+  workflow_dispatch:
+    inputs:
+      verify_limit:
+        description: 'Maximum active securities to history-verify this run'
+        required: false
+        default: '100'
+        type: string
+  schedule:
+    # Daily after the EGX session. Scheduled workflows execute from the default branch.
+    - cron: '15 13 * * 0-4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: egx-ticker-registry
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    name: Reconcile EGX security identities
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate automation configuration
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          if [ -z "$SUPABASE_SECRET_KEY" ]; then
+            echo "::error::SUPABASE_SECRET_KEY is not configured."
+            exit 1
+          fi
+          case "$SUPABASE_SECRET_KEY" in
+            sb_secret_*) ;;
+            *)
+              echo "::error::SUPABASE_SECRET_KEY must be a current sb_secret_ server key."
+              exit 1
+              ;;
+          esac
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Run ticker registry regressions
+        run: >-
+          npx vitest run
+          src/services/tickerRegistry.test.ts
+          src/services/tradingViewSymbolResolver.test.ts
+          src/services/marketPriceSync.test.ts
+
+      - name: Reconcile directory and resolver identities
+        env:
+          SUPABASE_URL: https://jhubsrbfiqjxdgngnwaq.supabase.co
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EGX_TICKER_VERIFY_LIMIT: ${{ inputs.verify_limit || '100' }}
+          EGX_TICKER_VERIFY_AFTER_DAYS: '30'
+          EGX_TICKER_INACTIVE_AFTER_DAYS: '14'
+        run: npm run sync:ticker-registry

@@ -1,22 +1,13 @@
+import { selectPositionQuote } from './positionQuote';
+import { EGX_SCANNER_PAYLOAD } from './scannerRequest';
 import { EGXTicker, Position, LivePriceQuote } from '../types';
-import { createEGXTickerRecord } from '../data/egxTickers';
+import { EGX_STOCK_DICTIONARY, LEGACY_TICKER_ALIASES, canonicalizeEGXSymbol, createEGXTickerRecord } from '../data/egxTickers';
 
 /**
  * Maps legacy, alternate, or renamed EGX tickers to active TradingView scanner symbols.
  * Ported from sherif007-noob/glide-update
  */
-export const TICKER_ALIASES: Record<string, string> = {
-  "QNBA": "QNBF",   // QNB Alahli
-  "MNHD": "MASR",   // Madinet Masr for Housing & Development
-  "AUTO": "GBCO",   // GB Corp
-  "OTMT": "OIH",    // Orascom Investment Holding
-  "COMI": "COMI",
-  "TMGH": "TMGH",
-  "SWDY": "SWDY",
-  "HRHO": "HRHO",
-  "ETEL": "ETEL",
-  "UBEG": "UBEE",   // United Bank
-};
+export const TICKER_ALIASES: Record<string, string> = LEGACY_TICKER_ALIASES;
 
 export interface EGXScheduleStatus {
   isSessionActive: boolean;
@@ -35,61 +26,30 @@ export interface TradingViewScanResult {
  * Queries TradingView Egypt market scanner API for delayed market data and closing-price data.
  * Uses the backend server proxy (/api/egx/scan) to guarantee reliable requests without CORS blocks.
  */
-export async function fetchTradingViewEGXPrices(): Promise<TradingViewScanResult> {
-  const payload = {
-    filter: [],
-    options: { lang: 'en' },
-    symbols: { query: { types: [] }, tickers: [] },
-    columns: [
-      'name',
-      'description',
-      'logoid',
-      'close',
-      'change',
-      'change_abs',
-      'volume',
-      'high',
-      'low',
-      'high_52_week',
-      'low_52_week',
-      'sector',
-      'RSI'
-    ],
-    sort: { sortBy: 'name', sortOrder: 'asc' },
-    range: [0, 500]
-  };
+export async function fetchTradingViewEGXPrices(
+  directory: EGXTicker[] = [],
+): Promise<TradingViewScanResult> {
+  const payload = EGX_SCANNER_PAYLOAD;
 
   let json: any = null;
-
-  try {
-    const proxyRes = await fetch('/api/egx/scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-
-    if (proxyRes.ok) {
-      json = await proxyRes.json();
-    }
-  } catch (err) {
-    console.warn('Proxy request failed, trying direct TradingView endpoint...', err);
+  let lastError: unknown;
+  // Retry the same-origin proxy before the optional direct endpoint. Every
+  // attempt is bounded so a stalled network cannot leave sync locked forever.
+  for (const endpoint of ['/api/egx/scan', '/api/egx/scan', 'https://scanner.tradingview.com/egypt/scan']) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), cache: 'no-store',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`Price scanner HTTP ${response.status}`);
+      const candidate = await response.json();
+      if (!Array.isArray(candidate?.data) || !candidate.data.length) throw new Error('Price scanner returned no data.');
+      json = candidate;
+      break;
+    } catch (error) { lastError = error; }
   }
-
-  if (!json || !json.data) {
-    const directRes = await fetch('https://scanner.tradingview.com/egypt/scan', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!directRes.ok) {
-      throw new Error(`TradingView Scanner HTTP ${directRes.status}: ${directRes.statusText}`);
-    }
-
-    json = await directRes.json();
-  }
+  if (!json) throw lastError instanceof Error ? lastError : new Error('Price scanner unavailable.');
 
   const data = json.data || [];
   const quotes: Record<string, LivePriceQuote> = {};
@@ -98,52 +58,44 @@ export async function fetchTradingViewEGXPrices(): Promise<TradingViewScanResult
   for (const item of data) {
     if (Array.isArray(item.d) && item.d.length >= 2) {
       const rawSymbol = String(item.d[0] || '').trim().toUpperCase();
-      const cleanTicker = rawSymbol.replace(/^EGX:/, '').replace(/\.CA$/, '');
-      
-      let description = '';
-      let logoId = '';
-      let close = 0;
-      let changePercent = 0;
-      let changeAbs = 0;
-      let volume = 0;
-      let high: number | undefined;
-      let low: number | undefined;
-      let yearHigh: number | undefined;
-      let yearLow: number | undefined;
-      let rsi: number | undefined;
+      const scannerSymbol = rawSymbol.replace(/^EGX:/, '').replace(/\.CA$/, '');
+      const directRegistry = directory.find(
+        (ticker) =>
+          ticker.metadataSource === 'registry' &&
+          ticker.directoryStatus !== 'inactive' &&
+          ticker.directoryStatus !== 'retired' &&
+          ticker.ticker.trim().toUpperCase() === scannerSymbol,
+      );
+      const aliasRegistry = directory.find(
+        (ticker) =>
+          ticker.metadataSource === 'registry' &&
+          ticker.directoryStatus !== 'inactive' &&
+          ticker.directoryStatus !== 'retired' &&
+          (ticker.aliases || []).some((alias) => alias.trim().toUpperCase() === scannerSymbol),
+      );
+      const cleanTicker =
+        directRegistry?.ticker.trim().toUpperCase() ||
+        aliasRegistry?.ticker.trim().toUpperCase() ||
+        canonicalizeEGXSymbol(scannerSymbol);
+      const description = typeof item.d[1] === 'string' ? String(item.d[1] || '').trim() : '';
+      const logoId = typeof item.d[2] === 'string' ? String(item.d[2] || '').trim() : '';
+      const close = Number(item.d[3] || 0);
+      const changePercent = Number(item.d[4] || 0);
+      const changeAbs = item.d[5] !== null && item.d[5] !== undefined ? Number(item.d[5]) : 0;
+      const volume = Number(item.d[6] || 0);
+      const high = item.d[7] !== null && item.d[7] !== undefined ? Number(item.d[7]) : undefined;
+      const low = item.d[8] !== null && item.d[8] !== undefined ? Number(item.d[8]) : undefined;
+      const yearHigh = item.d[9] !== null && item.d[9] !== undefined ? Number(item.d[9]) : undefined;
+      const yearLow = item.d[10] !== null && item.d[10] !== undefined ? Number(item.d[10]) : undefined;
+      const marketSector = typeof item.d[11] === 'string' ? String(item.d[11] || '').trim() : '';
+      const rsi = item.d[12] !== null && item.d[12] !== undefined ? Number(item.d[12]) : undefined;
+      const industry = typeof item.d[13] === 'string' ? String(item.d[13] || '').trim() : '';
+      const scannerIsin = typeof item.d[14] === 'string' ? String(item.d[14] || '').trim().toUpperCase() : '';
+      const currency = typeof item.d[15] === 'string' ? String(item.d[15] || '').trim().toUpperCase() : '';
 
-      if (typeof item.d[1] === 'string' && isNaN(Number(item.d[1]))) {
-        description = String(item.d[1] || '');
-        if (typeof item.d[2] === 'string' && isNaN(Number(item.d[2]))) {
-          logoId = String(item.d[2] || '');
-          close = Number(item.d[3] || 0);
-          changePercent = Number(item.d[4] || 0);
-          changeAbs = item.d[5] !== null && item.d[5] !== undefined ? Number(item.d[5]) : 0;
-          volume = Number(item.d[6] || 0);
-          high = item.d[7] !== null && item.d[7] !== undefined ? Number(item.d[7]) : undefined;
-          low = item.d[8] !== null && item.d[8] !== undefined ? Number(item.d[8]) : undefined;
-          yearHigh = item.d[9] !== null && item.d[9] !== undefined ? Number(item.d[9]) : undefined;
-          yearLow = item.d[10] !== null && item.d[10] !== undefined ? Number(item.d[10]) : undefined;
-          rsi = item.d[12] !== null && item.d[12] !== undefined ? Number(item.d[12]) : undefined;
-        } else {
-          close = Number(item.d[2] || 0);
-          changePercent = Number(item.d[3] || 0);
-          changeAbs = item.d[4] !== null && item.d[4] !== undefined ? Number(item.d[4]) : 0;
-          volume = Number(item.d[5] || 0);
-          high = item.d[6] !== null && item.d[6] !== undefined ? Number(item.d[6]) : undefined;
-          low = item.d[7] !== null && item.d[7] !== undefined ? Number(item.d[7]) : undefined;
-          yearHigh = item.d[8] !== null && item.d[8] !== undefined ? Number(item.d[8]) : undefined;
-          yearLow = item.d[9] !== null && item.d[9] !== undefined ? Number(item.d[9]) : undefined;
-          rsi = item.d[11] !== null && item.d[11] !== undefined ? Number(item.d[11]) : undefined;
-        }
-      } else {
-        close = Number(item.d[1] || 0);
-        changePercent = Number(item.d[2] || 0);
-        changeAbs = item.d[3] !== null && item.d[3] !== undefined ? Number(item.d[3]) : 0;
-        volume = Number(item.d[4] || 0);
-      }
-
-      if (close > 0) {
+      // This portfolio is EGP-denominated. Ignore alternate USD share classes rather
+      // than silently labeling a USD quote as EGP in the directory and valuation UI.
+      if (Number.isFinite(close) && close > 0 && (!currency || currency === 'EGP')) {
         const roundedPrice = Math.round(close * 100) / 100;
         const roundedChangePercent = Math.round(changePercent * 100) / 100;
         let calculatedChangeAbs = changeAbs;
@@ -164,6 +116,7 @@ export async function fetchTradingViewEGXPrices(): Promise<TradingViewScanResult
         };
 
         quotes[cleanTicker] = quote;
+        quotes[scannerSymbol] = quote;
         quotes[rawSymbol] = quote;
         const alias = resolveTickerSymbol(cleanTicker);
         if (alias && alias !== cleanTicker) {
@@ -182,7 +135,11 @@ export async function fetchTradingViewEGXPrices(): Promise<TradingViewScanResult
           rsi,
           description,
           logoId,
-          roundedChangeAbs
+          roundedChangeAbs,
+          marketSector,
+          industry,
+          scannerIsin,
+          true,
         );
         discoveredTickers.push(tickerObj);
       }
@@ -193,7 +150,7 @@ export async function fetchTradingViewEGXPrices(): Promise<TradingViewScanResult
 }
 
 export function resolveTickerSymbol(ticker: string): string {
-  const upper = ticker.trim().toUpperCase().replace(/^EGX:/, '').replace(/\.CA$/, '');
+  const upper = canonicalizeEGXSymbol(ticker);
   return TICKER_ALIASES[upper] || upper;
 }
 
@@ -208,47 +165,90 @@ export function applyLivePricesToPortfolio(
   const nowIso = new Date().toISOString();
 
   const tickerMap = new Map<string, EGXTicker>();
-  tickers.forEach(t => tickerMap.set(t.ticker.toUpperCase(), t));
+  tickers.forEach((ticker) => {
+    const raw = ticker.ticker.trim().toUpperCase().replace(/^EGX:/, '').replace(/\.CA$/, '');
+    const canonical = ticker.metadataSource === 'registry'
+      ? raw
+      : canonicalizeEGXSymbol(raw);
+    tickerMap.set(canonical, { ...ticker, ticker: canonical });
+  });
 
-  discoveredTickers.forEach(dt => {
-    const existing = tickerMap.get(dt.ticker.toUpperCase());
-    if (existing) {
-      if (
-        existing.lastPrice !== dt.lastPrice ||
-        existing.change !== dt.change ||
-        existing.volume !== dt.volume ||
-        existing.dayHigh !== dt.dayHigh ||
-        existing.dayLow !== dt.dayLow
-      ) {
-        hasChanges = true;
-        tickerMap.set(dt.ticker.toUpperCase(), {
-          ...existing,
-          lastPrice: dt.lastPrice,
-          change: dt.change,
-          changePercent: dt.changePercent,
-          volume: dt.volume || existing.volume,
-          dayHigh: dt.dayHigh || existing.dayHigh,
-          dayLow: dt.dayLow || existing.dayLow,
-          yearHigh: dt.yearHigh || existing.yearHigh,
-          yearLow: dt.yearLow || existing.yearLow,
-          rsi14: dt.rsi14 || existing.rsi14,
-          trendStatus: dt.trendStatus || existing.trendStatus,
-          lastUpdated: nowIso,
-          priceUpdatedAt: nowIso
-        });
-      }
-    } else {
+  discoveredTickers.forEach((dt) => {
+    const rawKey = dt.ticker.trim().toUpperCase().replace(/^EGX:/, '').replace(/\.CA$/, '');
+    const aliasedExisting = [...tickerMap.values()].find(
+      (ticker) => (ticker.aliases || []).some((alias) => alias.trim().toUpperCase() === rawKey),
+    );
+    const key = tickerMap.has(rawKey)
+      ? rawKey
+      : aliasedExisting?.ticker || canonicalizeEGXSymbol(rawKey);
+    const existing = tickerMap.get(key);
+    const fallback = EGX_STOCK_DICTIONARY[key];
+    const registryIdentity = existing?.metadataSource === 'registry';
+
+    const merged: EGXTicker = {
+      ...(existing || dt),
+      ...dt,
+      ticker: key,
+      nameEn: registryIdentity
+        ? existing!.nameEn
+        : (dt.nameEn || existing?.nameEn || fallback?.nameEn || key),
+      nameAr: registryIdentity
+        ? existing!.nameAr
+        : (fallback?.nameAr || existing?.nameAr || dt.nameAr || `${key} مصر`),
+      sector: registryIdentity
+        ? existing!.sector
+        : (dt.sector !== 'Other'
+          ? dt.sector
+          : (existing?.sector || fallback?.sector || 'Other')),
+      isin: registryIdentity
+        ? existing!.isin
+        : (dt.isin || existing?.isin || fallback?.isin || ''),
+      marketSector: registryIdentity
+        ? existing!.marketSector
+        : (dt.marketSector || existing?.marketSector),
+      industry: registryIdentity
+        ? existing!.industry
+        : (dt.industry || existing?.industry),
+      metadataSource: registryIdentity ? 'registry' : 'tradingview',
+      directoryStatus: existing?.directoryStatus,
+      aliases: existing?.aliases,
+      scannerSymbol: existing?.scannerSymbol,
+      historySymbol: existing?.historySymbol,
+      historyResolutionMethod: existing?.historyResolutionMethod,
+      historyVerifiedAt: existing?.historyVerifiedAt,
+      registryUpdatedAt: existing?.registryUpdatedAt,
+      lastUpdated: nowIso,
+      priceUpdatedAt: nowIso,
+    };
+
+    if (
+      !existing ||
+      existing.nameEn !== merged.nameEn ||
+      existing.nameAr !== merged.nameAr ||
+      existing.sector !== merged.sector ||
+      existing.isin !== merged.isin ||
+      existing.marketSector !== merged.marketSector ||
+      existing.industry !== merged.industry ||
+      existing.lastPrice !== merged.lastPrice ||
+      existing.change !== merged.change ||
+      existing.changePercent !== merged.changePercent ||
+      existing.volume !== merged.volume ||
+      existing.dayHigh !== merged.dayHigh ||
+      existing.dayLow !== merged.dayLow ||
+      existing.yearHigh !== merged.yearHigh ||
+      existing.yearLow !== merged.yearLow ||
+      existing.rsi14 !== merged.rsi14
+    ) {
       hasChanges = true;
-      dt.lastUpdated = nowIso;
-      dt.priceUpdatedAt = nowIso;
-      tickerMap.set(dt.ticker.toUpperCase(), dt);
     }
+
+    tickerMap.set(key, merged);
   });
 
   const updatedTickers = Array.from(tickerMap.values()).map(t => {
     const symbol = resolveTickerSymbol(t.ticker);
     const quote = quotes[symbol] || quotes[t.ticker.toUpperCase()];
-    if (quote) {
+    if (quote && Number.isFinite(quote.price) && quote.price > 0) {
       matchCount++;
       const changeEgp = quote.change !== undefined && !isNaN(quote.change)
         ? quote.change
@@ -259,6 +259,7 @@ export function applyLivePricesToPortfolio(
       const newDayLow = Math.min(t.dayLow || quote.price, quote.price);
       
       if (
+        t.priceUpdatedAt !== nowIso ||
         t.lastPrice !== quote.price ||
         t.change !== changeEgp ||
         t.changePercent !== quote.changePercent ||
@@ -290,14 +291,18 @@ export function applyLivePricesToPortfolio(
   let positionsChanged = false;
   const updatedPositions = positions.map(p => {
     const cleanSym = p.ticker.trim().toUpperCase();
-    const symbol = resolveTickerSymbol(cleanSym);
+    const symbol = tickerMap.has(cleanSym)
+      ? cleanSym
+      : ([...tickerMap.values()].find(
+          (ticker) => (ticker.aliases || []).some((alias) => alias.trim().toUpperCase() === cleanSym),
+        )?.ticker || resolveTickerSymbol(cleanSym));
     
     let newPrice = p.currentPrice;
     let newDayChange = p.dayChange;
     let newDayChangePercent = p.dayChangePercent;
     
     const quote = quotes[symbol] || quotes[cleanSym] || quotes[p.ticker];
-    if (quote && quote.price > 0) {
+    if (quote && Number.isFinite(quote.price) && quote.price > 0) {
       newPrice = quote.price;
       newDayChange = quote.change !== undefined ? quote.change : newDayChange;
       newDayChangePercent = quote.changePercent !== undefined ? quote.changePercent : newDayChangePercent;
@@ -310,21 +315,40 @@ export function applyLivePricesToPortfolio(
       } else {
         const matchedTicker = tickerMap.get(cleanSym) || tickerMap.get(symbol);
         if (matchedTicker && matchedTicker.lastPrice > 0) {
-          newPrice = matchedTicker.lastPrice;
-          newDayChange = matchedTicker.change !== undefined ? matchedTicker.change : newDayChange;
-          newDayChangePercent = matchedTicker.changePercent !== undefined ? matchedTicker.changePercent : newDayChangePercent;
+          const selected = selectPositionQuote(p, matchedTicker);
+          newPrice = selected.currentPrice;
+          newDayChange = selected.dayChange;
+          newDayChangePercent = selected.dayChangePercent;
         }
       }
     }
     
-    if (newPrice !== p.currentPrice || newDayChange !== p.dayChange || newDayChangePercent !== p.dayChangePercent) {
+    const liveMetadata =
+      tickerMap.get(symbol) ||
+      tickerMap.get(canonicalizeEGXSymbol(cleanSym));
+    const fallbackMetadata =
+      EGX_STOCK_DICTIONARY[symbol] ||
+      EGX_STOCK_DICTIONARY[canonicalizeEGXSymbol(cleanSym)];
+    const companyName = liveMetadata?.nameEn || fallbackMetadata?.nameEn || p.companyName;
+    const sector = liveMetadata?.sector || fallbackMetadata?.sector || p.sector;
+
+    if (
+      (quote && p.priceUpdatedAt !== nowIso) ||
+      newPrice !== p.currentPrice ||
+      newDayChange !== p.dayChange ||
+      newDayChangePercent !== p.dayChangePercent ||
+      p.companyName !== companyName ||
+      p.sector !== sector
+    ) {
       positionsChanged = true;
       return {
         ...p,
+        companyName,
+        sector,
         currentPrice: newPrice,
         dayChange: newDayChange,
         dayChangePercent: newDayChangePercent,
-        priceUpdatedAt: nowIso
+        priceUpdatedAt: quote ? nowIso : p.priceUpdatedAt
       };
     }
     return p;

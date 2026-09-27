@@ -1,28 +1,27 @@
-name: Intraday Prices
+name: Legacy Intraday 5m Repair
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/intraday-prices.yml'
-      - 'scripts/syncIntradayPrices.ts'
-  schedule:
-    # Broad UTC window covers the EGX session across Cairo DST changes.
-    # TradingView supplies the actual 15-minute bar timestamps; the cron time
-    # only determines how often we ingest newly completed/current bars.
-    - cron: '*/15 6-13 * * 0-4'
+    inputs:
+      tickers:
+        description: 'Optional comma-separated tickers for targeted legacy repair'
+        required: false
+        type: string
+      bar_count:
+        description: 'Optional TradingView 5m bar count override'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: egx-intraday-prices
-  cancel-in-progress: true
+  group: egx-intraday-market-data
+  cancel-in-progress: false
 
 jobs:
   sync:
+    name: Manual legacy TradingView 5m repair
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -53,10 +52,12 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Sync TradingView 15-minute prices
+      - name: Run manual legacy 5-minute repair
         env:
           SUPABASE_URL: https://jhubsrbfiqjxdgngnwaq.supabase.co
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           EGX_PORTFOLIO_ID: ${{ vars.EGX_PORTFOLIO_ID }}
           EGX_INTRADAY_RETENTION_DAYS: '90'
+          EGX_INTRADAY_TICKERS: ${{ inputs.tickers }}
+          EGX_INTRADAY_BAR_COUNT: ${{ inputs.bar_count }}
         run: npm run sync:intraday

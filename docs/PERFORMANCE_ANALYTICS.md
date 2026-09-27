@@ -37,6 +37,22 @@ equity = cash + market value of open holdings
 
 The system should not use current prices as a substitute for unavailable historical prices.
 
+## Capital baseline authority
+
+Legacy portfolios may predate explicit deposit/withdrawal ledger rows. In that case, analytics must not blindly trust a cached `capitalDeposits` scalar as the opening-capital baseline.
+
+The canonical legacy baseline is derived from the authoritative current cash balance and the transaction ledger:
+
+```text
+opening capital
+  = current cash
+  - cumulative signed ledger cash impact
+```
+
+When explicit deposit/withdrawal rows exist, net contributed capital is derived directly from those external flows instead.
+
+This rule is shared across Today and the daily 1W/1M/90D/YTD/All analytics. It prevents a stale opening-capital cache from shifting the entire NAV curve by a constant amount while leaving period P&L apparently correct.
+
 ## Money-weighted return
 
 The Reports performance chart uses a money-weighted return approach based on dated external cash flows and portfolio value.
@@ -151,7 +167,7 @@ Shared timeframe boundaries live in `src/services/analyticsTimeframes.ts`.
 | Timeframe | Definition | Resolution |
 | --- | --- | --- |
 | Today | Current EGX session after open, otherwise latest completed session | 15-minute |
-| 1W | Rolling 7 calendar days ending at the latest session | Daily |
+| 1W | Elapsed 7-day lookback ending at the latest session | Daily |
 | 1M | Rolling one calendar month ending at the latest session | Daily |
 | 90D | Rolling 90 calendar days ending at the latest session | Daily |
 | YTD | January 1 through the latest session | Daily |
@@ -290,6 +306,12 @@ The engine:
 A same-session transaction without an execution timestamp makes the 1D reconstruction incomplete. The app does not guess its position inside the session.
 
 The Today chart uses a straight `linear` line rather than a smoothed curve so the UI does not imply market observations that did not occur.
+
+The stored 15-minute bars reconstruct the session path. During the active session, if every currently held ticker has a valid live quote, the engine appends one final as-of valuation using the same live position prices that drive the portfolio hero/current NAV. This makes the chart endpoint converge on the current portfolio value without rewriting the earlier 15-minute path. If even one held ticker lacks a trustworthy live quote, no mixed live/stale endpoint is appended.
+
+### Seven-day window semantics
+
+`1W` uses an elapsed seven-day lookback: the boundary is exactly seven calendar days before the ending session. For example, an ending session of Sep 23 resolves to Sep 16. This matches the usual period-return convention of comparing the current value with the value one week earlier; the two boundary dates are endpoints, not seven inclusive date labels. The valuation selector uses the most recent complete valuation at or before that boundary when required.
 
 ### Current-session versus completed-session behavior
 
@@ -448,3 +470,18 @@ open market value
 For daily timeframes the chart uses historical daily closes. For Today it uses 15-minute prices, prior-session closes for the opening baseline, and exact execution timestamps for same-session trades.
 
 The secondary analytics service never mutates portfolio rows, positions, closed trades, or transactions.
+
+
+
+<!-- deployment-trigger: premium-cloudflare-2026-09-23-2331 -->
+
+### Rolling-period boundary valuation
+
+Daily rolling periods distinguish the **first plotted date** from the **beginning-of-period valuation**. If a 1W chart ends on Sep 23, its plotted window begins Sep 16, but the return baseline is the last complete close strictly before that boundary (Sep 15). This is the portfolio value at the beginning of Sep 16; using Sep 16's closing valuation would discard the first day's performance. External capital flows after the baseline are neutralized by the return calculations.
+
+
+## Market-data consistency audit (September 28, 2026)
+
+Today uses one Cairo session for Auto/1m/5m/15m/1h. Missing current-session candles do not authorize switching dates. Secondary unrealized P&L uses the primary engine's market value minus ledger remaining cost and buy fees, so candle timing and the complete live endpoint match the main chart. Drawdown continues to use the unified performance curve. Daily 1W/1M/90D/YTD/ALL reads are paginated in `(trading_date, ticker)` order. Intraday reads use `(bar_timestamp, ticker)` order. Visible history and realized-trajectory windows refresh independently of whether a quote price changed. Daily axis labels are Cairo-based across device timezones.
+
+The visual curves, materials, navigation, and accepted Phase 8/9 hierarchy are unchanged. See [the audit](MARKET_DATA_AUDIT_2026_09_28.md) for evidence and deployment limits.

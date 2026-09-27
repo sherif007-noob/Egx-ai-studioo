@@ -1,0 +1,93 @@
+name: Intraday 1m Migration Smoke
+
+on:
+  push:
+    branches:
+      - feature/premium-ui-redesign
+    paths:
+      - '.github/workflows/intraday-1m-smoke.yml'
+      - 'scripts/syncIntradayOneMinute.ts'
+      - 'src/services/intraday*.ts'
+      - 'src/services/tradingViewSymbolResolver.ts'
+      - 'src/services/tradingViewSymbolResolver.test.ts'
+      - 'src/services/egxTradingSession.ts'
+      - 'src/services/egxTradingSession.test.ts'
+      - 'src/services/tickerRegistry.ts'
+      - 'src/components/charts/PerformanceTimeframeChart.tsx'
+      - 'src/components/PerformanceReports.tsx'
+      - 'src/App.tsx'
+      - 'supabase/migrations/20260924_ticker_registry*.sql'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: egx-intraday-1m-smoke
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Validate migration and current portfolio
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate automation configuration
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          if [ -z "$SUPABASE_SECRET_KEY" ]; then
+            echo "::error::SUPABASE_SECRET_KEY is not configured in repository Actions secrets."
+            exit 1
+          fi
+          case "$SUPABASE_SECRET_KEY" in
+            sb_secret_*) ;;
+            *)
+              echo "::error::SUPABASE_SECRET_KEY must be a current sb_secret_ server key."
+              exit 1
+              ;;
+          esac
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Run intraday migration regression tests
+        run: >-
+          npx vitest run
+          src/services/intradayPolicy.test.ts
+          src/services/intradayBackfillPlan.test.ts
+          src/services/intradayAggregation.test.ts
+          src/services/intradayTickerUniverse.test.ts
+          src/services/intradayResolution.test.ts
+          src/services/tradingViewSymbolResolver.test.ts
+          src/services/tickerRegistry.test.ts
+          src/services/intradayAnalyticsEngine.test.ts
+          src/services/egxTradingSession.test.ts
+
+      - name: Rebuild ACTF and NAPR from TradingView 1m
+        env:
+          SUPABASE_URL: https://jhubsrbfiqjxdgngnwaq.supabase.co
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EGX_PORTFOLIO_ID: ${{ vars.EGX_PORTFOLIO_ID }}
+          EGX_INTRADAY_TICKERS: ACTF,NAPR,ORAS
+          EGX_INTRADAY_FULL_REPAIR: 'true'
+        run: npm run sync:intraday:1m
+
+      - name: Sync current session-relevant portfolio universe
+        env:
+          SUPABASE_URL: https://jhubsrbfiqjxdgngnwaq.supabase.co
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EGX_PORTFOLIO_ID: ${{ vars.EGX_PORTFOLIO_ID }}
+          EGX_INTRADAY_FULL_REPAIR: 'false'
+        run: npm run sync:intraday:1m

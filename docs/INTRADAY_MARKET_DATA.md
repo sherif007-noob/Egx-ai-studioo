@@ -2,24 +2,54 @@
 
 ## Purpose
 
-The intraday market-data layer stores 15-minute EGX bars for portfolio-relevant securities. It is the data foundation for future 1D portfolio analytics, including transaction-aware NAV, MWR, TWR, and Telda-style session charts.
+The intraday market-data layer provides real EGX observations for Today analytics without fabricating market points.
 
-This layer does not change portfolio accounting and does not render charts by itself.
+The target and current Premium architecture is:
 
-## Source and interval
+```text
+TradingView 1m
+  -> GitHub Actions / Node
+      -> raw 1m history (30 calendar days)
+      -> deterministic local 1m -> 5m aggregation
+      -> derived 5m history (90 calendar days)
+  -> Supabase
+      -> Today reader: sufficient 1m -> sufficient 5m -> legacy 15m
 
-- Source: TradingView through `@ch99q/twc`
-- Exchange: EGX
-- Interval: 15 minutes
-- Storage timezone: UTC (`timestamptz`)
-- Display/analytics timezone: `Africa/Cairo`
-- Retention: 90 rolling calendar days by default
+TradingView Scanner HTTP
+  -> authoritative latest/live endpoint when the complete held-ticker snapshot is available
+```
 
-TradingView supplies the actual bar timestamps. GitHub Actions scheduling controls ingestion frequency only; it does not manufacture bar boundaries.
+Cloudflare Workers serve the application/API but do not open TradingView WebSockets. Browser startup never triggers TradingView history repair.
+
+## Canonical policy
+
+The authoritative constants live in:
+
+```text
+src/services/intradayPolicy.ts
+```
+
+Current policy:
+
+| Setting | Value |
+| --- | --- |
+| Raw interval | 1 minute |
+| Derived interval | 5 minutes |
+| Legacy fallback | 15 minutes |
+| Raw retention | 30 calendar days |
+| Derived retention | 90 calendar days |
+| Timezone | `Africa/Cairo` |
+| Regular session | 10:00-14:30 Cairo |
+| Scheduled ingestion grace | through 15:15 Cairo |
+| Trading weekdays | Sunday-Thursday |
+| Scheduled cadence target | about every 5 minutes |
+| Read order | 1m -> 5m -> 15m |
+
+Cairo session calculations use `Intl.DateTimeFormat` with `Africa/Cairo`; they do not assume a fixed UTC offset. This matters across Egypt daylight-saving changes.
 
 ## Database table
 
-Intraday bars are stored separately from permanent daily history:
+Intraday bars are stored in:
 
 ```text
 public.intraday_price_history
@@ -31,139 +61,296 @@ Primary key:
 (ticker, interval_minutes, bar_timestamp)
 ```
 
-Columns:
+The production interval constraint accepts:
 
-| Column | Purpose |
-| --- | --- |
-| `ticker` | Normalized EGX ticker |
-| `interval_minutes` | Bar interval; currently fixed at 15 |
-| `bar_timestamp` | UTC bar timestamp |
-| `open` | Bar open |
-| `high` | Bar high |
-| `low` | Bar low |
-| `close` | Bar close |
-| `volume` | Bar volume when available |
-| `source` | Market-data source |
-| `retrieved_at` | Last ingestion timestamp |
+```text
+1, 5, 15
+```
 
-Daily bars remain in `price_history` and are retained permanently.
+Columns include normalized ticker, interval, UTC timestamp, OHLCV, source and retrieval time.
 
-## Access control
+Daily history remains in `price_history` and is retained permanently.
 
-The table is exposed to the application as read-only market data:
+## Source semantics
 
-- `authenticated`: SELECT only
-- `anon`: no access
-- trusted server/automation role: SELECT/INSERT/UPDATE/DELETE
-- RLS: enabled
-- authenticated SELECT policy: allows signed-in users to read market bars
+### Raw 1-minute rows
 
-Browser code must never receive the Supabase server secret.
+Raw rows use:
 
-## Sync universe
+- `interval_minutes = 1`;
+- `source = tradingview`;
+- TradingView timestamps and OHLCV;
+- UTC storage;
+- insert-only semantics for completed historical timestamps.
 
-The ingestion script synchronizes:
+A later TradingView response must not silently rewrite an already-persisted historical 1-minute observation.
 
-1. tickers appearing in portfolio transactions within the retention window;
-2. all currently open-position tickers.
+### Derived 5-minute rows
 
-This ensures a ticker that was traded intraday and fully closed can still be reconstructed for a historical session.
+`aggregateIntradayBars()` builds 5-minute buckets from actual 1-minute observations:
 
-For diagnostics or targeted backfills, `EGX_INTRADAY_TICKERS` can override the discovered universe with a comma-separated ticker list.
+- open = first observed 1m open;
+- high = maximum observed high;
+- low = minimum observed low;
+- close = final observed close;
+- volume = sum of observed volume.
 
-## Initial backfill and incremental sync
+Missing minutes are never synthesized. An illiquid security may legitimately have only one or two observations in a five-minute bucket.
 
-The first successful sync detects that no bars are stored and requests enough recent 15-minute observations to cover approximately the configured retention period.
+Derived rows use:
 
-Subsequent syncs inspect the newest stored timestamp per ticker and request only a bounded overlapping window. Existing primary-key rows are upserted so the currently forming 15-minute bar can be refreshed safely.
+```text
+source = derived-1m
+```
 
-The sync intentionally overlaps recent bars. Correctness is preferred over trying to infer whether TradingView's newest bar is final.
+When the same raw timestamp appears in a later TradingView retrieval, the already-persisted raw 1-minute row wins during derivation. This keeps the 5-minute cache exactly reconstructible from the stored raw source of truth.
+
+### Legacy 5-minute bootstrap
+
+Some securities may have older direct-TradingView 5-minute rows that predate the deepest 1-minute history TradingView will return. Those rows are retained only outside reconstructible 1-minute coverage.
+
+They are migration bootstrap/fallback data, not a reason to fabricate older 1-minute observations.
+
+### Legacy 15-minute fallback
+
+The old 15-minute dataset remains available during rollout. It is not deleted until the new pipeline has been observed reliably across multiple sessions.
+
+## Ticker resolution
+
+TradingView identity resolution is centralized in:
+
+```text
+src/services/tradingViewSymbolResolver.ts
+```
+
+Resolution attempts are logged, including failures. For example, current validation records NAPR as:
+
+```text
+ticker NAPR -> invalid symbol
+ISIN EGS370O1C013 -> success
+```
+
+Do not add ticker-specific ingestion hacks when ticker/canonical/ISIN resolution can solve the identity generically.
+
+## Today ticker universe
+
+Today analytics and automatic 1-minute ingestion operate on session-relevant securities:
+
+1. securities held entering the session;
+2. securities currently held;
+3. securities bought or sold during the session;
+4. same-day round trips.
+
+CASH and unrelated closed historical positions are excluded.
+
+Browser selection uses:
+
+```text
+resolveIntradaySessionTickers(transactions, sessionDate)
+```
+
+The Node sync separately resolves the current position/session-trade universe from Supabase.
+
+Explicit `EGX_INTRADAY_TICKERS` still overrides discovery for diagnostics and targeted repairs.
+
+## Backfill and incremental sync
+
+The 1-minute sync is:
+
+```text
+scripts/syncIntradayOneMinute.ts
+```
+
+It distinguishes:
+
+- `full-derived-backfill`;
+- `raw-backfill`;
+- `incremental`.
+
+TradingView history is retrieved in bounded batches: an initial request followed by bounded `request_more_data` batches until the required time boundary is reached, TradingView reports source exhaustion, or the configured safety limit is reached.
+
+The current canonical limits are:
+
+- initial backfill: 5,000 bars;
+- additional batch: 5,000 bars;
+- maximum additional batches: 10;
+- incremental request: 1,200 bars;
+- normal incremental overlap: 2 days.
+
+This intentionally avoids assuming that a fixed bar count equals a fixed calendar range; liquidity determines how much calendar history a count represents.
 
 ## Retention
 
-At the end of each successful run, the server-side sync removes rows older than the configured retention period.
+After ingestion:
 
-Default:
+- raw 1m rows older than the 30-day day-aligned cutoff are pruned;
+- derived 5m rows older than the 90-day day-aligned cutoff are pruned;
+- daily history remains permanent;
+- legacy 15m remains during migration.
+
+Planning and pruning use the same day-aligned cutoff so the first retained derived bucket is not made partially unreconstructible by retention itself.
+
+## Adaptive browser reads
+
+Today loads candidate resolutions from Supabase and uses:
 
 ```text
-90 days
+selectBestIntradayResolution(...)
 ```
 
-Override:
+Selection is not based merely on whether one 1-minute row exists.
 
-```env
-EGX_INTRADAY_RETENTION_DAYS=90
+For each session-relevant ticker, the selector compares the observed session envelope across available resolutions. A tiny late/early 1m sample cannot displace a healthier 5m dataset, while sparse legitimate trading remains acceptable because the selector does not require a candle every minute.
+
+The requested session comes from the Cairo EGX clock: before opening and on weekends it selects the previous trading weekday. Every resolution must match that exact session. Missing ingestion is not evidence of a holiday: an empty current session remains unavailable rather than silently displaying an older day. Manual 1m never falls back to a different resolution. Auto isolates failed resolution reads and can use a healthy same-session fallback. History refreshes every five minutes while visible and on resume/reconnection, independently of price changes.
+
+## Today chart resolution control
+
+The Today analytics chart exposes:
+
+```text
+Auto | 1m | 5m | 15m | 1h
 ```
 
-The accepted range is capped by the script to prevent accidental unbounded retention.
+`Auto` remains the default and preserves the coverage-aware `1m -> 5m -> 15m` selector.
+
+Manual `1m`, `5m`, and `15m` choices read the corresponding persisted interval for the selected session. The `1h` view is intentionally not another storage tier: it is derived client-side from the healthiest available persisted intraday source using the same observed-only OHLCV aggregation semantics. Missing observations are not synthesized.
+
+Changing the Today display resolution changes chart sampling only. It does not change transaction timing, portfolio accounting, live-price authority, ingestion cadence, retention, or the underlying stored market data.
+
+## Today session boundary and endpoint
+
+The Today chart reconstructs the current EGX session from a session boundary rather than rebuilding current cash from inception.
+
+1. **Authoritative session-opening cash.** When the current portfolio cash balance is available, Today derives the cash balance at the first market bar by reversing the signed cash impact of session executions that occur at or after that first bar. It then replays those executions forward against real intraday market observations. This makes Today independent of stale legacy `capitalDeposits` / inception-opening-capital state while preserving auditable transaction effects.
+2. **Historical fallback.** If no current cash boundary is available, the engine may still reconstruct from the historical opening-capital model for offline/tests/legacy callers.
+3. **Post-close timestamp pinning.** During the live EGX session, a complete live quote snapshot may be appended at its real as-of time. After the regular 14:30 Cairo close, the live endpoint is pinned immediately after the final observed market point instead of using the later phone/browser wall-clock time. This prevents a 23:xx refresh from making the Today axis appear to extend into the night.
+
+The Today engine does not vertically shift a finished equity curve to force a target total. Cash, shares, prices and transaction impacts must reconcile at their source.
+
+## Live endpoint
+
+The TradingView Scanner HTTP snapshot remains separate from persisted intraday ingestion.
+
+A complete live snapshot may be appended only to the same Cairo session date. Every held position must have the same valid scanner receipt timestamp; mixed snapshots and previous-day cached prices cannot anchor live NAV. A mixed snapshot where a currently held ticker lacks a trustworthy live quote must not be treated as a complete portfolio endpoint.
+
+## Workflow scheduling
+
+Primary workflow:
+
+```text
+.github/workflows/intraday-1m-sync.yml
+```
+
+On the Premium branch it is configured for:
+
+```text
+*/5 7-13 * * 0-4
+```
+
+GitHub cron is UTC. The Node script applies the authoritative Cairo-local session gate and post-close grace window, so the broad UTC window safely covers Cairo DST changes.
+
+Important: GitHub scheduled workflows execute from the repository default branch. The Premium schedule is staged code and does not become the production scheduler until that branch is intentionally promoted.
+
+Legacy direct-TradingView 5-minute workflow:
+
+```text
+.github/workflows/intraday-prices.yml
+```
+
+is manual-only. It remains a repair/rollback tool and is no longer a competing scheduled producer.
+
+Both reviewed workflows share the same concurrency group and queue rather than cancelling an active writer. The old workflow on main uses a different group until rollout; retire that scheduled producer during promotion.
 
 ## Commands
 
-Run manually:
+Primary 1-minute sync:
+
+```bash
+npm run sync:intraday:1m
+```
+
+Read-only 1-minute diagnostic:
+
+```bash
+npm run diagnose:intraday:1m
+```
+
+Legacy manual 5-minute repair:
 
 ```bash
 npm run sync:intraday
 ```
 
-Required environment:
+Required server-side environment:
 
 ```env
 SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 SUPABASE_SECRET_KEY=sb_secret_...
 ```
 
-Recommended:
+Optional:
 
 ```env
 EGX_PORTFOLIO_ID=...
-EGX_INTRADAY_RETENTION_DAYS=90
+EGX_INTRADAY_TICKERS=ACTF,NAPR
+EGX_INTRADAY_FULL_REPAIR=true
 ```
 
-Optional targeted run:
+The Supabase secret must never be exposed to browser code.
 
-```env
-EGX_INTRADAY_TICKERS=ORAS,TALM,MASR
-```
+## Observability
 
-Optional fixed TradingView request size for diagnostics:
+Per-ticker sync logs include:
 
-```env
-EGX_INTRADAY_BAR_COUNT=200
-```
+- ticker and resolved symbol;
+- complete resolver attempt path;
+- migration mode;
+- additional TradingView batches;
+- source-exhaustion state;
+- fetched 1m bars;
+- inserted 1m bars;
+- newly appended 1m bars;
+- repaired historical 1m gaps;
+- persisted raw bars used for derivation;
+- upserted 5m buckets;
+- legacy bootstrap rows;
+- earliest/latest fetched timestamps;
+- previous raw/derived coverage.
 
-## GitHub Actions
+A `repaired1mGaps` count means an actual TradingView observation was missing at or before the previously-known latest raw timestamp. It does **not** count minutes in which an illiquid security simply did not trade.
 
-`.github/workflows/intraday-prices.yml` runs every 15 minutes during a broad Sunday-through-Thursday UTC window.
+The final summary reports session-relevant/resolved ticker counts, fetch/insert/derivation totals, source exhaustion, bootstrap limitations, retention pruning and failures.
 
-The broad window intentionally covers Cairo daylight-saving changes. If a scheduled run occurs outside an active market period, TradingView simply returns the most recent bars and the database upsert remains idempotent.
+## Validated migration cases
 
-Workflow concurrency allows only one active intraday ingestion run at a time.
+ACTF/NAPR migration validation on 2026-09-24 confirmed:
 
-## Browser reads
+- zero duplicate raw/derived timestamps;
+- ACTF ticker resolution succeeds directly;
+- NAPR ticker resolution fails then succeeds through ISIN `EGS370O1C013`;
+- persisted raw 1m and derived 5m overlap exactly after the persisted-source derivation fix;
+- legacy ACTF 5m rows remain only before TradingView's available 1m history boundary.
 
-`src/services/intradayPriceStore.ts` provides normalized, timestamp-sorted intraday series.
-
-The underlying Supabase reader paginates in batches of 1,000 rows so future analytics are not silently truncated by a Data API row limit.
+The smoke workflow typechecks and runs the intraday regression suite before writing test migration data.
 
 ## Data-integrity rules
 
-- Never synthesize missing prices.
-- Reject malformed or non-positive OHLC data.
-- Keep timestamps as UTC in storage.
-- Convert to Cairo only when determining/displaying the trading session.
-- Do not mix 15-minute rows into the daily `price_history` table.
-- Do not use intraday bars to mutate accounting records.
-- A missing ticker/session must remain explicitly missing until a trusted source supplies it.
+- Never synthesize missing market points.
+- Never overwrite a completed historical 1m row during ordinary sync.
+- Derive reconstructible 5m from persisted 1m truth.
+- Reject malformed/non-positive OHLC.
+- Store timestamps in UTC; interpret sessions using Cairo timezone rules.
+- Do not mix intraday rows into permanent daily history.
+- Do not mutate accounting records from market-data ingestion.
+- Do not run TradingView WebSocket ingestion in Cloudflare Workers.
+- Do not trigger history repair from the browser.
+- Preserve 15m fallback until rollout observation is complete.
 
-## Next phase
+See `docs/INTRADAY_1M_MIGRATION_PLAN.md` for the canonical 15-phase rollout status.
 
-Pass 2 consumes this foundation to create a unified analytics engine for:
+## September 28 audit and repair
 
-- portfolio NAV;
-- net deposits;
-- MWR;
-- TWR;
-- drawdown;
-- consistent timeframe boundaries.
+See [MARKET_DATA_AUDIT_2026_09_28.md](MARKET_DATA_AUDIT_2026_09_28.md) for confirmed production evidence, implementation changes, verification, and the remaining scheduler promotion step.
 
-No chart presentation assumptions belong in the market-data layer.
+Manual ingestion now resolves the latest EGX session rather than using the calendar day after midnight. Set `EGX_INTRADAY_SKIP_RETENTION=true` for a repair that must not prune old rows. Normal scheduled retention remains 30/90 days.

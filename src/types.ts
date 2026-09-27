@@ -21,6 +21,11 @@ export type Sector =
   | 'Energy & Petrochemicals'
   | 'Energy & Oil Services'
   | 'Utilities & Logistics'
+  | 'Utilities'
+  | 'Commercial Services'
+  | 'Contracting & Construction'
+  | 'Paper & Packaging'
+  | 'Trade & Distributors'
   | 'Transport & Logistics'
   | 'Consumer Goods & Automobiles'
   | 'Tourism & Leisure'
@@ -54,6 +59,19 @@ export interface EGXTicker {
   lastUpdated: string;
   priceUpdatedAt?: string;
   logoUrl?: string;
+  /** Raw market classification returned by the live scanner. */
+  marketSector?: string;
+  industry?: string;
+  /** Distinguishes authoritative registry identity from live scanner and offline fallback metadata. */
+  metadataSource?: 'baseline' | 'tradingview' | 'registry';
+  /** Service-managed directory lifecycle and resolver metadata. */
+  directoryStatus?: 'active' | 'inactive' | 'retired' | 'unresolved';
+  aliases?: string[];
+  scannerSymbol?: string;
+  historySymbol?: string;
+  historyResolutionMethod?: string;
+  historyVerifiedAt?: string;
+  registryUpdatedAt?: string;
 }
 
 export interface Position {

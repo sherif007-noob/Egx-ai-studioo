@@ -70,4 +70,224 @@ describe('intraday analytics engine', () => {
     expect(result.dataQuality.hasUsableRange).toBe(false);
     expect(result.dataQuality.incompleteDays).toBeGreaterThan(0);
   });
+
+  it('never attaches Sunday live quotes to a Thursday chart', () => {
+    const transactions = [
+      tx({ id: 'dep-old', type: 'BUY', ticker: 'CASH', shares: 1000, price: 1, totalAmount: 1000, cashFlowType: 'DEPOSIT', cashFlowAmount: 1000, date: '2026-09-23' }),
+      tx({ id: 'hold-old', type: 'BUY', ticker: 'TEST', shares: 5, price: 100, totalAmount: 500, date: '2026-09-23', executedAt: '2026-09-23T08:00:00Z' }),
+    ];
+    const result = buildIntradayAnalyticsResult(transactions,
+      { TEST: [{ date: '2026-09-23', close: 100 }] },
+      { TEST: [{ timestamp: '2026-09-24T07:00:00Z', intervalMinutes: 1, open: 100, high: 100, low: 100, close: 100 }] },
+      { sessionDate: '2026-09-24', asOf: '2026-09-27T08:00:00Z', livePrices: { TEST: 200 } });
+    expect(result.summary.endEquity).toBe(1000);
+    expect(result.points.at(-1)?.date).toBe('2026-09-24T07:01:00.000Z');
+  });
+
+  it('appends the authoritative live NAV as the final active-session point', () => {
+    const transactions: TradeTransaction[] = [
+      tx({ id: 'dep', type: 'BUY', ticker: 'CASH', shares: 1000, price: 1, totalAmount: 1000, cashFlowType: 'DEPOSIT', cashFlowAmount: 1000, date: '2026-09-16' }),
+      tx({ id: 'hold', type: 'BUY', ticker: 'TEST', shares: 5, price: 100, totalAmount: 500, date: '2026-09-17', executedAt: '2026-09-17T06:30:00Z' }),
+    ];
+
+    const result = buildIntradayAnalyticsResult(
+      transactions,
+      { TEST: [{ date: '2026-09-16', close: 100 }] },
+      {
+        TEST: [
+          { timestamp: '2026-09-17T07:00:00Z', intervalMinutes: 15, open: 100, high: 101, low: 99, close: 100 },
+          { timestamp: '2026-09-17T07:15:00Z', intervalMinutes: 15, open: 100, high: 101, low: 99, close: 100 },
+        ],
+      },
+      {
+        sessionDate: '2026-09-17',
+        asOf: '2026-09-17T07:37:00Z',
+        livePrices: { TEST: 102 },
+      },
+    );
+
+    expect(result.points.at(-1)?.date).toBe('2026-09-17T07:37:00.000Z');
+    expect(result.summary.endEquity).toBe(1010);
+    expect(result.summary.pnlEgp).toBe(10);
+  });
+
+  it('does not append a mixed stale/live endpoint when a held ticker lacks a live quote', () => {
+    const transactions: TradeTransaction[] = [
+      tx({ id: 'dep', type: 'BUY', ticker: 'CASH', shares: 1000, price: 1, totalAmount: 1000, cashFlowType: 'DEPOSIT', cashFlowAmount: 1000, date: '2026-09-16' }),
+      tx({ id: 'a', type: 'BUY', ticker: 'AAA', shares: 2, price: 100, totalAmount: 200, date: '2026-09-17', executedAt: '2026-09-17T06:30:00Z' }),
+      tx({ id: 'b', type: 'BUY', ticker: 'BBB', shares: 2, price: 100, totalAmount: 200, date: '2026-09-17', executedAt: '2026-09-17T06:30:00Z' }),
+    ];
+
+    const result = buildIntradayAnalyticsResult(
+      transactions,
+      {
+        AAA: [{ date: '2026-09-16', close: 100 }],
+        BBB: [{ date: '2026-09-16', close: 100 }],
+      },
+      {
+        AAA: [{ timestamp: '2026-09-17T07:00:00Z', intervalMinutes: 15, open: 100, high: 101, low: 99, close: 100 }],
+        BBB: [{ timestamp: '2026-09-17T07:00:00Z', intervalMinutes: 15, open: 100, high: 101, low: 99, close: 100 }],
+      },
+      {
+        sessionDate: '2026-09-17',
+        asOf: '2026-09-17T07:37:00Z',
+        livePrices: { AAA: 102 },
+      },
+    );
+
+    expect(result.points.at(-1)?.date).toBe('2026-09-17T07:15:00.000Z');
+    expect(result.summary.endEquity).toBe(1000);
+  });
+
+
+  it('keeps accounting invariants stable across 15m, 5m and 1m while improving execution timing', () => {
+    const transactions: TradeTransaction[] = [
+      tx({ id: 'dep', type: 'BUY', ticker: 'CASH', shares: 2000, price: 1, totalAmount: 2000, cashFlowType: 'DEPOSIT', cashFlowAmount: 2000, date: '2026-09-16' }),
+      tx({ id: 'hold', type: 'BUY', ticker: 'OLD', shares: 10, price: 50, totalAmount: 500, date: '2026-09-16', executedAt: '2026-09-16T08:00:00Z' }),
+      tx({ id: 'new', type: 'BUY', ticker: 'NEW', shares: 5, price: 20, fees: 1, totalAmount: 101, date: '2026-09-17', executedAt: '2026-09-17T07:07:00Z' }),
+    ];
+
+    const historical = {
+      OLD: [{ date: '2026-09-16', close: 100 }],
+      NEW: [{ date: '2026-09-16', close: 20 }],
+    };
+
+    const buildSeries = (intervalMinutes: number) => {
+      const stepMs = intervalMinutes * 60_000;
+      const startMs = Date.parse('2026-09-17T07:00:00Z');
+      const endMs = Date.parse('2026-09-17T07:30:00Z');
+      const points = [];
+      for (let at = startMs; at < endMs; at += stepMs) {
+        points.push({
+          timestamp: new Date(at).toISOString(),
+          intervalMinutes,
+          open: 100,
+          high: 100,
+          low: 100,
+          close: 100,
+        });
+      }
+      const newPoints = points.map((point) => ({
+        ...point,
+        open: 20,
+        high: 20,
+        low: 20,
+        close: 20,
+      }));
+      return { OLD: points, NEW: newPoints };
+    };
+
+    const options = {
+      sessionDate: '2026-09-17',
+      asOf: '2026-09-17T07:30:00Z',
+      livePrices: { OLD: 100, NEW: 20 },
+    };
+
+    const one = buildIntradayAnalyticsResult(transactions, historical, buildSeries(1), options);
+    const five = buildIntradayAnalyticsResult(transactions, historical, buildSeries(5), options);
+    const fifteen = buildIntradayAnalyticsResult(transactions, historical, buildSeries(15), options);
+
+    for (const result of [five, fifteen]) {
+      expect(result.summary.startEquity).toBeCloseTo(one.summary.startEquity ?? 0, 8);
+      expect(result.summary.endEquity).toBeCloseTo(one.summary.endEquity ?? 0, 8);
+      expect(result.summary.pnlEgp).toBeCloseTo(one.summary.pnlEgp ?? 0, 8);
+      expect(result.summary.netExternalFlow).toBeCloseTo(one.summary.netExternalFlow, 8);
+      expect(result.summary.twrPercent).toBeCloseTo(one.summary.twrPercent ?? 0, 8);
+      expect(result.summary.mwrrPercent).toBeCloseTo(one.summary.mwrrPercent ?? 0, 8);
+    }
+
+    const onePostTrade = one.points.find((point) => point.date === '2026-09-17T07:08:00.000Z');
+    const fivePostTrade = five.points.find((point) => point.date === '2026-09-17T07:10:00.000Z');
+    const fifteenPostTrade = fifteen.points.find((point) => point.date === '2026-09-17T07:15:00.000Z');
+
+    expect(onePostTrade?.cash).toBe(1399);
+    expect(fivePostTrade?.cash).toBe(1399);
+    expect(fifteenPostTrade?.cash).toBe(1399);
+    expect(one.points.some((point) => point.date === '2026-09-17T07:08:00.000Z')).toBe(true);
+    expect(fifteen.points.some((point) => point.date === '2026-09-17T07:08:00.000Z')).toBe(false);
+  });
+
+
+  it('pins a same-day post-close live endpoint to the final EGX market point', () => {
+    const transactions: TradeTransaction[] = [
+      tx({ id: 'dep-close', type: 'BUY', ticker: 'CASH', shares: 1000, price: 1, totalAmount: 1000, cashFlowType: 'DEPOSIT', cashFlowAmount: 1000, date: '2026-09-23' }),
+      tx({ id: 'hold-close', type: 'BUY', ticker: 'TEST', shares: 5, price: 100, totalAmount: 500, date: '2026-09-23', executedAt: '2026-09-23T08:00:00Z' }),
+    ];
+
+    const result = buildIntradayAnalyticsResult(
+      transactions,
+      { TEST: [{ date: '2026-09-23', close: 100 }] },
+      {
+        TEST: [
+          { timestamp: '2026-09-24T11:14:00Z', intervalMinutes: 1, open: 100, high: 101, low: 99, close: 100 },
+          { timestamp: '2026-09-24T11:29:00Z', intervalMinutes: 1, open: 100, high: 102, low: 99, close: 101 },
+        ],
+      },
+      {
+        sessionDate: '2026-09-24',
+        asOf: '2026-09-24T20:43:00Z',
+        livePrices: { TEST: 102 },
+      },
+    );
+
+    const last = result.points.at(-1);
+    expect(last?.date).toBe('2026-09-24T11:30:00.001Z');
+    expect(result.summary.endEquity).toBe(last?.equity);
+    expect(result.summary.pnlEgp).toBeCloseTo(
+      (result.summary.endEquity ?? 0) - (result.summary.startEquity ?? 0) - result.summary.netExternalFlow,
+      8,
+    );
+  });
+
+  it('reconstructs Today from authoritative current cash instead of a stale opening-capital baseline', () => {
+    const transactions: TradeTransaction[] = [
+      tx({
+        id: 'legacy-hold',
+        type: 'BUY',
+        ticker: 'TEST',
+        shares: 5,
+        price: 100,
+        totalAmount: 500,
+        date: '2026-09-23',
+        executedAt: '2026-09-23T08:00:00Z',
+      }),
+      tx({
+        id: 'session-buy',
+        type: 'BUY',
+        ticker: 'TEST',
+        shares: 1,
+        price: 100,
+        totalAmount: 100,
+        date: '2026-09-24',
+        executedAt: '2026-09-24T07:05:00Z',
+      }),
+    ];
+
+    const result = buildIntradayAnalyticsResult(
+      transactions,
+      { TEST: [{ date: '2026-09-23', close: 100 }] },
+      {
+        TEST: [
+          { timestamp: '2026-09-24T07:00:00Z', intervalMinutes: 1, open: 100, high: 100, low: 100, close: 100 },
+          { timestamp: '2026-09-24T07:05:00Z', intervalMinutes: 1, open: 100, high: 101, low: 100, close: 101 },
+        ],
+      },
+      {
+        sessionDate: '2026-09-24',
+        openingCapital: 1600, // deliberately stale by +600
+        currentCashBalance: 400, // authoritative: 1000 initial - 500 old buy - 100 session buy
+        asOf: '2026-09-24T07:07:00Z',
+        livePrices: { TEST: 102 },
+      },
+    );
+
+    expect(result.summary.startEquity).toBeCloseTo(1000, 8);
+    expect(result.summary.endEquity).toBeCloseTo(1012, 8);
+    expect(result.summary.pnlEgp).toBeCloseTo(12, 8);
+
+    const first = result.points[0];
+    const last = result.points.at(-1);
+    expect(first?.cash).toBeCloseTo(500, 8);
+    expect(last?.cash).toBeCloseTo(400, 8);
+  });
 });

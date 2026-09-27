@@ -1,6 +1,7 @@
+import { selectPositionQuote } from '../services/positionQuote';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Position, ClosedTrade, TradeTransaction, EGXTicker, Sector, CashTransaction } from '../types';
-import { INITIAL_EGX_TICKERS } from '../data/egxTickers';
+import { INITIAL_EGX_TICKERS, mergeTickerDirectoryWithBaseline } from '../data/egxTickers';
 import {
   INITIAL_POSITIONS,
   INITIAL_CLOSED_TRADES,
@@ -33,6 +34,7 @@ import {
 } from '../services/portfolioAccounting';
 import { normalizeTransaction } from '../utils/portfolioMetrics';
 import { applyCashLedgerEvent, changeCashLedgerEntry, rebuildAfterLedgerChange } from '../services/cashLedger';
+import { resolveTickerFromDirectory } from '../services/tickerRegistry';
 
 const STORAGE_KEY_POSITIONS = 'egx_pwa_positions_v3_reconciled';
 const STORAGE_KEY_CLOSED = 'egx_pwa_closed_trades_v3_reconciled';
@@ -41,11 +43,68 @@ const STORAGE_KEY_TICKERS = 'egx_pwa_tickers_directory_v3_reconciled';
 const STORAGE_KEY_TRANSACTIONS = 'egx_pwa_transactions_v3_reconciled';
 const STORAGE_KEY_CAPITAL = 'egx_pwa_capital_deposits_v1';
 
+function rehydrateTransactionMetadata(
+  transactionList: TradeTransaction[],
+  tickerList: EGXTicker[],
+): TradeTransaction[] {
+  if (!transactionList.length || !tickerList.length) return transactionList;
+  const tickerMap = new Map(tickerList.map((ticker) => [ticker.ticker.trim().toUpperCase(), ticker]));
+  let changed = false;
+
+  const next = transactionList.map((transaction) => {
+    if (transaction.ticker.trim().toUpperCase() === 'CASH') return transaction;
+    const canonicalTicker = resolveTickerFromDirectory(transaction.ticker, tickerList);
+    const ticker = tickerMap.get(canonicalTicker);
+    if (!ticker) return transaction;
+
+    const companyName = ticker.nameEn || transaction.companyName;
+    const sector = ticker.sector !== 'Other' ? ticker.sector : transaction.sector;
+    if (
+      transaction.ticker === canonicalTicker &&
+      transaction.companyName === companyName &&
+      transaction.sector === sector
+    ) return transaction;
+
+    changed = true;
+    return { ...transaction, ticker: canonicalTicker, companyName, sector };
+  });
+
+  return changed ? next : transactionList;
+}
+
+function rehydrateClosedTradeMetadata(
+  tradeList: ClosedTrade[],
+  tickerList: EGXTicker[],
+): ClosedTrade[] {
+  if (!tradeList.length || !tickerList.length) return tradeList;
+  const tickerMap = new Map(tickerList.map((ticker) => [ticker.ticker.trim().toUpperCase(), ticker]));
+  let changed = false;
+
+  const next = tradeList.map((trade) => {
+    const canonicalTicker = resolveTickerFromDirectory(trade.ticker, tickerList);
+    const ticker = tickerMap.get(canonicalTicker);
+    if (!ticker) return trade;
+
+    const companyName = ticker.nameEn || trade.companyName;
+    const sector = ticker.sector !== 'Other' ? ticker.sector : trade.sector;
+    if (
+      trade.ticker === canonicalTicker &&
+      trade.companyName === companyName &&
+      trade.sector === sector
+    ) return trade;
+
+    changed = true;
+    return { ...trade, ticker: canonicalTicker, companyName, sector };
+  });
+
+  return changed ? next : tradeList;
+}
+
 export function usePortfolioState() {
   const [tickers, setTickers] = useState<EGXTicker[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY_TICKERS);
-      return saved ? JSON.parse(saved) : INITIAL_EGX_TICKERS;
+      return saved ? mergeTickerDirectoryWithBaseline(JSON.parse(saved)) : INITIAL_EGX_TICKERS;
     } catch {
       return INITIAL_EGX_TICKERS;
     }
@@ -65,8 +124,8 @@ export function usePortfolioState() {
       const saved = localStorage.getItem(STORAGE_KEY_TRANSACTIONS);
       const parsed = saved ? JSON.parse(saved) : INITIAL_TRANSACTIONS;
       return Array.isArray(parsed) && parsed.length > 0
-        ? parsed.map(normalizeTransaction)
-        : INITIAL_TRANSACTIONS;
+        ? rehydrateTransactionMetadata(parsed.map(normalizeTransaction), tickers)
+        : rehydrateTransactionMetadata(INITIAL_TRANSACTIONS, tickers);
     } catch {
       return INITIAL_TRANSACTIONS;
     }
@@ -156,16 +215,18 @@ export function usePortfolioState() {
   useEffect(() => {
     let activeUnsubscribe: (() => void) | null = null;
     let isMounted = true;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
     const initializeRemotePortfolio = async () => {
       try {
         const remoteData = await loadPortfolioFromFirestore();
+        if (!remoteData) throw new Error('Authoritative portfolio is unavailable.');
         if (remoteData && isMounted) {
           isRemoteSyncingRef.current = true;
           let loadedPositions = Array.isArray(remoteData.positions) ? remoteData.positions : [];
           let loadedClosed = Array.isArray(remoteData.closedTrades) ? remoteData.closedTrades : [];
 
-          const loadedTransactions = Array.isArray(remoteData.transactions)
+          let loadedTransactions = Array.isArray(remoteData.transactions)
             ? remoteData.transactions.map(normalizeTransaction).sort(
                 (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
               )
@@ -175,25 +236,21 @@ export function usePortfolioState() {
           const loadedCapital = typeof remoteData.capitalDeposits === 'number' && remoteData.capitalDeposits >= 0
             ? remoteData.capitalDeposits
             : capitalDeposits;
-          const loadedTickers = Array.isArray(remoteData.tickers) && remoteData.tickers.length > 0
-            ? remoteData.tickers
-            : tickers;
+          const loadedTickers = mergeTickerDirectoryWithBaseline(
+            Array.isArray(remoteData.tickers) && remoteData.tickers.length > 0
+              ? remoteData.tickers
+              : tickers,
+          );
+          loadedTransactions = rehydrateTransactionMetadata(loadedTransactions, loadedTickers);
 
           if (loadedTransactions.length > 0 && (loadedPositions.length === 0 || loadedClosed.length === 0)) {
             const report = reconcilePortfolioFromLedger(loadedTransactions, loadedTickers, loadedCapital, loadedPositions);
             if (loadedPositions.length === 0) loadedPositions = report.reconciledPositions;
             if (loadedClosed.length === 0) loadedClosed = report.reconciledClosedTrades;
             if (loadedCash === 0) loadedCash = report.reconciledCashBalance;
-            debouncedSavePortfolioToFirestore({
-              positions: loadedPositions,
-              closedTrades: loadedClosed,
-              transactions: loadedTransactions,
-              cashBalance: loadedCash,
-              capitalDeposits: loadedCapital,
-              tickers: loadedTickers,
-            }, 300);
           }
 
+          setIsInitialized(true);
           setPositions(loadedPositions);
           setClosedTrades(loadedClosed);
           setTransactions(loadedTransactions);
@@ -204,8 +261,8 @@ export function usePortfolioState() {
         }
       } catch (err) {
         console.warn('Initial Supabase load failed, using local cache:', err);
-      } finally {
-        if (isMounted) setIsInitialized(true);
+        if (isMounted) retryTimer = setTimeout(initializeRemotePortfolio, 30_000);
+        return;
       }
 
       try { await flushPendingWriteQueue(); } catch { /* ignore */ }
@@ -217,19 +274,42 @@ export function usePortfolioState() {
           isRemoteSyncingRef.current = true;
           let loadedPositions = Array.isArray(remoteData.positions) ? remoteData.positions : [];
           let loadedClosed = Array.isArray(remoteData.closedTrades) ? remoteData.closedTrades : [];
-          const loadedTransactions = Array.isArray(remoteData.transactions)
-            ? remoteData.transactions.map(normalizeTransaction)
-            : [];
+          const loadedTickers = mergeTickerDirectoryWithBaseline(
+            Array.isArray(remoteData.tickers) && remoteData.tickers.length > 0
+              ? remoteData.tickers
+              : tickers,
+          );
+          const loadedTransactions = rehydrateTransactionMetadata(
+            Array.isArray(remoteData.transactions)
+              ? remoteData.transactions.map(normalizeTransaction)
+              : [],
+            loadedTickers,
+          );
 
           if (loadedTransactions.length > 0 && (loadedPositions.length === 0 || loadedClosed.length === 0)) {
-            const report = reconcilePortfolioFromLedger(loadedTransactions, tickers, capitalDeposits, loadedPositions);
+            const report = reconcilePortfolioFromLedger(loadedTransactions, loadedTickers, capitalDeposits, loadedPositions);
             if (loadedPositions.length === 0) loadedPositions = report.reconciledPositions;
             if (loadedClosed.length === 0) loadedClosed = report.reconciledClosedTrades;
           }
 
-          setPositions(loadedPositions);
+          setPositions(previous => loadedPositions.map(incoming => {
+            const local = previous.find(p => p.ticker === incoming.ticker);
+            const quote = selectPositionQuote(incoming, local ? {
+              ticker: local.ticker, lastPrice: local.currentPrice, change: local.dayChange,
+              changePercent: local.dayChangePercent, priceUpdatedAt: local.priceUpdatedAt,
+            } as EGXTicker : undefined);
+            return { ...incoming, ...quote };
+          }));
           setClosedTrades(loadedClosed);
           setTransactions(loadedTransactions);
+          if (Array.isArray(remoteData.tickers) && remoteData.tickers.length > 0) setTickers(previous => loadedTickers.map(incoming => {
+            const local = previous.find(t => t.ticker === incoming.ticker);
+            if (local && (Date.parse(local.priceUpdatedAt ?? '') || 0) > (Date.parse(incoming.priceUpdatedAt ?? '') || 0)) {
+              return { ...incoming, lastPrice: local.lastPrice, change: local.change,
+                changePercent: local.changePercent, priceUpdatedAt: local.priceUpdatedAt };
+            }
+            return incoming;
+          }));
           if (typeof remoteData.cashBalance === 'number' && Number.isFinite(remoteData.cashBalance)) setCashBalance(remoteData.cashBalance);
           if (typeof remoteData.capitalDeposits === 'number' && remoteData.capitalDeposits >= 0) setCapitalDeposits(remoteData.capitalDeposits);
           setTimeout(() => { isRemoteSyncingRef.current = false; }, 150);
@@ -243,6 +323,7 @@ export function usePortfolioState() {
 
     return () => {
       isMounted = false;
+      clearTimeout(retryTimer);
       if (activeUnsubscribe) activeUnsubscribe();
     };
   }, []);
@@ -268,14 +349,28 @@ export function usePortfolioState() {
     const tickerMap = new Map(tickerList.map((t) => [t.ticker.trim().toUpperCase(), t]));
     let hasChanges = false;
     const rehydrated = posList.map((p) => {
-      const t = tickerMap.get(p.ticker.trim().toUpperCase());
+      const canonicalTicker = resolveTickerFromDirectory(p.ticker, tickerList);
+      const t = tickerMap.get(canonicalTicker);
       if (!t) return p;
-      const currentPrice = t.lastPrice > 0 ? t.lastPrice : p.currentPrice;
+      const quote = selectPositionQuote(p, t);
+      const currentPrice = quote.currentPrice;
       const targetPrice = p.targetPrice ?? t.targetPrice;
       const stopLoss = p.stopLoss ?? t.stopLoss;
-      if (Math.abs((p.currentPrice || 0) - currentPrice) > 0.0001 || p.targetPrice !== targetPrice || p.stopLoss !== stopLoss) {
+      const companyName = t.nameEn || p.companyName || canonicalTicker;
+      const sector = t.sector !== 'Other' ? t.sector : (p.sector || 'Other');
+      if (
+        p.priceUpdatedAt !== quote.priceUpdatedAt ||
+        p.dayChange !== quote.dayChange ||
+        p.dayChangePercent !== quote.dayChangePercent ||
+        p.ticker !== canonicalTicker ||
+        Math.abs((p.currentPrice || 0) - currentPrice) > 0.0001 ||
+        p.targetPrice !== targetPrice ||
+        p.stopLoss !== stopLoss ||
+        p.companyName !== companyName ||
+        p.sector !== sector
+      ) {
         hasChanges = true;
-        return { ...p, currentPrice, targetPrice, stopLoss, companyName: p.companyName || t.nameEn || p.ticker, sector: p.sector || t.sector || 'Other' };
+        return { ...p, ...quote, ticker: canonicalTicker, currentPrice, targetPrice, stopLoss, companyName, sector };
       }
       return p;
     });
@@ -284,6 +379,8 @@ export function usePortfolioState() {
 
   useEffect(() => {
     setPositions((prev) => rehydratePositionsWithTickers(prev, tickers));
+    setTransactions((prev) => rehydrateTransactionMetadata(prev, tickers));
+    setClosedTrades((prev) => rehydrateClosedTradeMetadata(prev, tickers));
   }, [tickers, rehydratePositionsWithTickers]);
 
   const addTrade = useCallback((tradeInput: {
@@ -301,7 +398,7 @@ export function usePortfolioState() {
     deductFromCash?: boolean;
     cycleTag?: string;
   }) => {
-    const tickerKey = tradeInput.ticker.trim().toUpperCase();
+    const tickerKey = resolveTickerFromDirectory(tradeInput.ticker, tickers);
     const { grossCost, fees, cashOutflow } = calculateBuyImpact(
       tradeInput.shares,
       tradeInput.price,

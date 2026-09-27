@@ -3,6 +3,8 @@ import type { HistoricalPriceSeries } from './historicalPriceStore';
 import type { IntradayPricePoint, IntradayPriceSeries } from './intradayPriceStore';
 import { cairoDateKey, normalizeIntradayTicker } from './intradayPriceStore';
 import { resolveAnalyticsWindow } from './analyticsTimeframes';
+import { egxCairoSessionClock } from './egxTradingSession';
+import { INTRADAY_POLICY } from './intradayPolicy';
 import {
   buildExternalCashFlows,
   sortPerformanceTransactions,
@@ -38,24 +40,21 @@ function hasExplicitCapitalFlow(transactions: TradeTransaction[]): boolean {
   });
 }
 
-function applyTransaction(
-  tx: TradeTransaction,
-  state: { cash: number; shares: Map<string, number>; executionPrices: Map<string, number> },
-) {
+function transactionCashImpact(tx: TradeTransaction): number {
   const ticker = normalizeIntradayTicker(tx.ticker);
 
   if (ticker === 'CASH') {
     const kind = cashFlowKind(tx);
-    const amount = Math.abs(Number(tx.cashFlowAmount ?? tx.totalAmount));
-    if (!Number.isFinite(amount)) return;
-
-    if (kind === 'DIVIDEND' || kind === 'DEPOSIT' || (!kind && tx.type === 'BUY')) state.cash += amount;
-    else if (kind === 'FEE' || kind === 'WITHDRAWAL' || (!kind && tx.type === 'SELL')) state.cash -= amount;
-    else if (kind === 'CASH_ADJUSTMENT') {
+    if (kind === 'CASH_ADJUSTMENT') {
       const signed = Number(tx.cashFlowAmount ?? tx.totalAmount);
-      if (Number.isFinite(signed)) state.cash += signed;
+      return Number.isFinite(signed) ? signed : 0;
     }
-    return;
+
+    const amount = Math.abs(Number(tx.cashFlowAmount ?? tx.totalAmount));
+    if (!Number.isFinite(amount)) return 0;
+    if (kind === 'DIVIDEND' || kind === 'DEPOSIT' || (!kind && tx.type === 'BUY')) return amount;
+    if (kind === 'FEE' || kind === 'WITHDRAWAL' || (!kind && tx.type === 'SELL')) return -amount;
+    return 0;
   }
 
   const shares = Number(tx.shares);
@@ -64,24 +63,48 @@ function applyTransaction(
   const gross = Number.isFinite(tx.grossTradeValue)
     ? Number(tx.grossTradeValue)
     : shares * price;
-
-  if (!Number.isFinite(shares) || shares <= 0 || !Number.isFinite(price) || price <= 0) return;
+  if (!Number.isFinite(shares) || shares <= 0 || !Number.isFinite(price) || price <= 0) return 0;
 
   if (tx.type === 'BUY') {
-    state.cash -= Number.isFinite(tx.totalAmount) && tx.totalAmount > 0
+    if (Number.isFinite(tx.netCashImpact) && Number(tx.netCashImpact) < 0) {
+      return Number(tx.netCashImpact);
+    }
+    return -(Number.isFinite(tx.totalAmount) && tx.totalAmount > 0
       ? Number(tx.totalAmount)
-      : gross + fees;
-    state.shares.set(ticker, (state.shares.get(ticker) || 0) + shares);
-    state.executionPrices.set(ticker, price);
-  } else {
-    state.cash += Number.isFinite(tx.totalAmount) && tx.totalAmount > 0
-      ? Number(tx.totalAmount)
-      : Number.isFinite(tx.netCashImpact)
-        ? Number(tx.netCashImpact)
-        : gross - fees;
-    state.shares.set(ticker, Math.max(0, (state.shares.get(ticker) || 0) - shares));
-    state.executionPrices.set(ticker, price);
+      : gross + fees);
   }
+
+  if (Number.isFinite(tx.netCashImpact) && Number(tx.netCashImpact) > 0) {
+    return Number(tx.netCashImpact);
+  }
+  return Number.isFinite(tx.totalAmount) && tx.totalAmount > 0
+    ? Number(tx.totalAmount)
+    : gross - fees;
+}
+
+function applyTransaction(
+  tx: TradeTransaction,
+  state: { cash: number; shares: Map<string, number>; executionPrices: Map<string, number> },
+) {
+  const ticker = normalizeIntradayTicker(tx.ticker);
+  const cashImpact = transactionCashImpact(tx);
+
+  if (ticker === 'CASH') {
+    state.cash += cashImpact;
+    return;
+  }
+
+  const shares = Number(tx.shares);
+  const price = Number(tx.price);
+  if (!Number.isFinite(shares) || shares <= 0 || !Number.isFinite(price) || price <= 0) return;
+
+  state.cash += cashImpact;
+  if (tx.type === 'BUY') {
+    state.shares.set(ticker, (state.shares.get(ticker) || 0) + shares);
+  } else {
+    state.shares.set(ticker, Math.max(0, (state.shares.get(ticker) || 0) - shares));
+  }
+  state.executionPrices.set(ticker, price);
 }
 
 function previousClose(
@@ -156,7 +179,9 @@ export function buildIntradayAnalyticsResult(
   options: {
     sessionDate: string;
     openingCapital?: number;
+    currentCashBalance?: number;
     asOf?: string | Date;
+    livePrices?: Record<string, number>;
   },
 ): UnifiedAnalyticsResult {
   const sessionDate = options.sessionDate.slice(0, 10);
@@ -227,6 +252,21 @@ export function buildIntradayAnalyticsResult(
     }
     if (executed < baselineMs) applyTransaction(tx, state);
     else sessionTransactions.push(tx);
+  }
+
+  // Today is a session reconstruction, not an inception reconstruction.
+  // When the current cash account is available, derive the session-opening cash
+  // by reversing only the session executions that occur at/after the first bar.
+  // This makes the Today path independent of stale legacy opening-capital state.
+  const hasLaterLedgerTransactions = ordered.some((tx) => dayKey(tx.date) > sessionDate);
+  if (Number.isFinite(options.currentCashBalance) && !hasLaterLedgerTransactions) {
+    const futureSessionImpact = sessionTransactions
+      .filter((tx) => {
+        const executed = parseMs(tx.executedAt);
+        return Number.isFinite(executed) && executed <= asOfMs;
+      })
+      .reduce((sum, tx) => sum + transactionCashImpact(tx), 0);
+    state.cash = Number(options.currentCashBalance) - futureSessionImpact;
   }
 
   const previousCloses = new Map<string, number>();
@@ -386,6 +426,113 @@ export function buildIntradayAnalyticsResult(
   }
 
   const completePoints = points.filter((point) => point.complete);
+
+  // Persisted intraday bars reconstruct the path, but the live quote snapshot is
+  // the authoritative endpoint for the current active session. Append one
+  // as-of point only when every currently held ticker has a trustworthy live
+  // quote; never mix a partial live snapshot with stale bar closes.
+  if (options.livePrices && completePoints.length && sessionDate === cairoDateKey(asOfDate.toISOString())) {
+    while (
+      txIndex < transactionsByTime.length &&
+      parseMs(transactionsByTime[txIndex].executedAt) <= asOfMs
+    ) {
+      applyTransaction(transactionsByTime[txIndex], state);
+      txIndex += 1;
+    }
+
+    const normalizedLivePrices = new Map<string, number>();
+    for (const [rawTicker, rawPrice] of Object.entries(options.livePrices)) {
+      const ticker = normalizeIntradayTicker(rawTicker);
+      const price = Number(rawPrice);
+      if (ticker && Number.isFinite(price) && price > 0) normalizedLivePrices.set(ticker, price);
+    }
+
+    const missingLiveTickers: string[] = [];
+    let liveMarketValue = 0;
+    for (const [ticker, shares] of state.shares.entries()) {
+      if (shares <= EPSILON) continue;
+      const price = normalizedLivePrices.get(ticker);
+      if (price === undefined) {
+        missingLiveTickers.push(ticker);
+        continue;
+      }
+      liveMarketValue += shares * price;
+    }
+
+    if (!missingLiveTickers.length) {
+      const lastPoint = completePoints.at(-1)!;
+      const lastPointMs = parseMs(lastPoint.date);
+      if (asOfMs > lastPointMs) {
+        const liveEquity = state.cash + liveMarketValue;
+        const intervalExternalFlows = sessionExternalFlows.filter((flow) => {
+          const flowMs = parseMs(flow.date);
+          return flowMs > lastPointMs && flowMs <= asOfMs;
+        });
+        const externalFlow = intervalExternalFlows.reduce(
+          (sum, flow) => sum + portfolioExternalFlow(flow),
+          0,
+        );
+
+        if (previousEquity > EPSILON) {
+          const subperiodReturn = (liveEquity - externalFlow) / previousEquity - 1;
+          if (Number.isFinite(subperiodReturn) && subperiodReturn > -1) {
+            twrFactor *= 1 + subperiodReturn;
+          }
+        }
+
+        const twrPercent = (twrFactor - 1) * 100;
+        const performanceIndex = 100 * twrFactor;
+        performancePeak = Math.max(performancePeak, performanceIndex);
+        const drawdownPercent = performancePeak > 0
+          ? ((performanceIndex - performancePeak) / performancePeak) * 100
+          : null;
+        equityPeak = Math.max(equityPeak, liveEquity);
+
+        // A live quote sync can happen long after the regular EGX session
+        // has closed. Never stretch the Today chart to the wall-clock sync time:
+        // after 14:30 Cairo, pin the authoritative endpoint immediately after
+        // the final observed market point. During an active session, keep the
+        // actual as-of timestamp. A later-calendar-day quote is likewise kept
+        // attached to the latest completed session.
+        const cairoClock = egxCairoSessionClock(asOfDate);
+        const sameSessionDate = sessionDate === cairoClock.dateKey;
+        const afterRegularClose =
+          sameSessionDate &&
+          cairoClock.minuteOfDay >= INTRADAY_POLICY.sessionEndMinutes;
+        const endpointMs =
+          sameSessionDate && !afterRegularClose
+            ? asOfMs
+            : lastPointMs + 1;
+        const timestamp = formatIso(endpointMs);
+        const netDeposits = openingNetDeposits + sessionExternalFlows
+          .filter((flow) => parseMs(flow.date) <= asOfMs)
+          .reduce((sum, flow) => sum + portfolioExternalFlow(flow), 0);
+
+        completePoints.push({
+          date: timestamp,
+          equity: liveEquity,
+          cash: state.cash,
+          marketValue: liveMarketValue,
+          netDeposits,
+          externalFlow,
+          twrPercent,
+          mwrrPercent: calculatePeriodMWR(
+            baselineEquity,
+            formatIso(baselineMs),
+            sessionExternalFlows,
+            liveEquity,
+            timestamp,
+          ),
+          annualizedMwrrPercent: null,
+          performanceIndex,
+          drawdownPercent,
+          equityDrawdownEgp: Math.max(0, equityPeak - liveEquity),
+          complete: true,
+        });
+      }
+    }
+  }
+
   const first = completePoints[0];
   const last = completePoints.at(-1);
   const netExternalFlow = first && last

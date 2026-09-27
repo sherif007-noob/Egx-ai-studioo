@@ -68,9 +68,24 @@ async function supabaseFetchWithJwtRetry(input: RequestInfo | URL, init?: Reques
   }
 }
 
+let configuredSupabaseUrl: string | undefined;
+let configuredSupabaseSecretKey: string | undefined;
+
+async function createTradingViewSession() {
+  // These TradingView repair functions are Node-only. Cloudflare no longer
+  // calls them, so keep @ch99q/twc on its native Node WebSocket path with
+  // the custom handshake headers TradingView expects.
+  return createSession();
+}
+
+export function configureSupabaseServer(url?: string, secretKey?: string) {
+  configuredSupabaseUrl = url;
+  configuredSupabaseSecretKey = secretKey;
+}
+
 function getSupabaseAdmin() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SECRET_KEY;
+  const url = configuredSupabaseUrl || process.env.SUPABASE_URL;
+  const key = configuredSupabaseSecretKey || process.env.SUPABASE_SECRET_KEY;
   if (!url || !key || !key.startsWith('sb_secret_')) throw new Error('Supabase server credentials are not configured correctly.');
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },

@@ -1,0 +1,109 @@
+import { describe, expect, it } from 'vitest';
+import { aggregateIntradayBars, intradayBucketRange, mergeIntradayBarsByTimestamp } from './intradayAggregation';
+import type { IntradayPricePoint } from './intradayPriceStore';
+
+function bar(minute: number, values: Partial<IntradayPricePoint> = {}): IntradayPricePoint {
+  return {
+    timestamp: `2026-09-24T07:${String(minute).padStart(2, '0')}:00.000Z`,
+    intervalMinutes: 1,
+    open: 10,
+    high: 10,
+    low: 10,
+    close: 10,
+    volume: 100,
+    source: 'tradingview',
+    ...values,
+  };
+}
+
+describe('intraday aggregation', () => {
+  it('derives deterministic 5-minute OHLCV from 1-minute bars', () => {
+    const result = aggregateIntradayBars([
+      bar(0, { open: 10, high: 11, low: 9.5, close: 10.5, volume: 100 }),
+      bar(1, { open: 10.5, high: 12, low: 10, close: 11.5, volume: 200 }),
+      bar(4, { open: 11.5, high: 11.8, low: 10.8, close: 11, volume: 50 }),
+    ], 5);
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        timestamp: '2026-09-24T07:00:00.000Z',
+        intervalMinutes: 5,
+        open: 10,
+        high: 12,
+        low: 9.5,
+        close: 11,
+        volume: 350,
+        source: 'derived-1m',
+      }),
+    ]);
+  });
+
+  it('does not synthesize missing minutes inside an illiquid bucket', () => {
+    const result = aggregateIntradayBars([
+      bar(1, { open: 20, high: 21, low: 20, close: 20.5, volume: 10 }),
+      bar(4, { open: 20.5, high: 22, low: 20.5, close: 21.5, volume: 15 }),
+    ], 5);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].open).toBe(20);
+    expect(result[0].close).toBe(21.5);
+    expect(result[0].volume).toBe(25);
+  });
+
+  it('skips bars whose source interval is coarser than the target interval', () => {
+    const result = aggregateIntradayBars([
+      { ...bar(0), intervalMinutes: 15 },
+    ], 5);
+    expect(result).toEqual([]);
+  });
+
+  it('prefers persisted raw observations when a later source fetch revises the same minute', () => {
+    const fetched = [
+      bar(30, { volume: 2867, retrievedAt: '2026-09-24T12:00:00.000Z' }),
+      bar(31, { volume: 2761, retrievedAt: '2026-09-24T12:00:00.000Z' }),
+    ];
+    const persisted = [
+      bar(30, { volume: 2015, retrievedAt: '2026-09-24T10:48:00.000Z' }),
+    ];
+
+    const canonical = mergeIntradayBarsByTimestamp(fetched, persisted);
+
+    expect(canonical).toHaveLength(2);
+    expect(canonical[0].volume).toBe(2015);
+    expect(canonical[0].retrievedAt).toBe('2026-09-24T10:48:00.000Z');
+    expect(aggregateIntradayBars(canonical, 5)[0].volume).toBe(4776);
+  });
+
+  it('expands a partial fetch window to complete derived bucket boundaries', () => {
+    expect(
+      intradayBucketRange(
+        '2026-09-22T11:28:00.000Z',
+        '2026-09-24T11:28:00.000Z',
+        5,
+      ),
+    ).toEqual({
+      fromTimestamp: '2026-09-22T11:25:00.000Z',
+      toTimestamp: '2026-09-24T11:29:59.999Z',
+    });
+  });
+
+  it('derives 1-hour OHLCV without synthesizing missing observations', () => {
+    const result = aggregateIntradayBars([
+      bar(0, { open: 10, high: 11, low: 9.5, close: 10.5, volume: 100 }),
+      bar(4, { open: 10.5, high: 12, low: 10, close: 11.5, volume: 200 }),
+      { ...bar(0, { open: 11.5, high: 13, low: 11, close: 12.5, volume: 50 }), timestamp: '2026-09-24T07:45:00.000Z' },
+    ], 60);
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        timestamp: '2026-09-24T07:00:00.000Z',
+        intervalMinutes: 60,
+        open: 10,
+        high: 13,
+        low: 9.5,
+        close: 12.5,
+        volume: 350,
+      }),
+    ]);
+  });
+});

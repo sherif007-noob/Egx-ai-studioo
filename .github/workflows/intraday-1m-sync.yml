@@ -1,0 +1,71 @@
+name: Intraday 1m Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Optional comma-separated tickers (blank = session-relevant portfolio universe)'
+        required: false
+        type: string
+      full_repair:
+        description: 'Force the deepest available 1m bootstrap and rebuild reconstructible derived 5m history'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # GitHub cron is UTC and scheduled workflows run from the default branch.
+    # 07:00-13:59 UTC covers Cairo's session and delayed close across DST
+    # changes. The Node script applies the authoritative Africa/Cairo session
+    # gate through 15:15 Cairo for delayed final bars and runner delays.
+    - cron: '*/5 7-13 * * 0-4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: egx-intraday-market-data
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync raw 1m and derived 5m
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate automation configuration
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          if [ -z "$SUPABASE_SECRET_KEY" ]; then
+            echo "::error::SUPABASE_SECRET_KEY is not configured in repository Actions secrets."
+            exit 1
+          fi
+          case "$SUPABASE_SECRET_KEY" in
+            sb_secret_*) ;;
+            *)
+              echo "::error::SUPABASE_SECRET_KEY must be a current sb_secret_ server key."
+              exit 1
+              ;;
+          esac
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Sync TradingView 1-minute history and derive 5-minute history
+        env:
+          SUPABASE_URL: https://jhubsrbfiqjxdgngnwaq.supabase.co
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          EGX_PORTFOLIO_ID: ${{ vars.EGX_PORTFOLIO_ID }}
+          EGX_INTRADAY_TICKERS: ${{ inputs.tickers }}
+          EGX_INTRADAY_FULL_REPAIR: ${{ inputs.full_repair }}
+          EGX_INTRADAY_SCHEDULED: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+        run: npm run sync:intraday:1m

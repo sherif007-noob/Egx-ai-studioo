@@ -1,4 +1,4 @@
-import { loadIntradayPricesFromSupabase } from './supabasePersistence';
+import { INTRADAY_POLICY } from './intradayPolicy';
 
 export interface IntradayPricePoint {
   timestamp: string;
@@ -8,7 +8,7 @@ export interface IntradayPricePoint {
   low: number;
   close: number;
   volume?: number;
-  source?: 'tradingview' | 'yahoo' | 'other';
+  source?: 'tradingview' | 'derived-1m' | 'yahoo' | 'other';
   retrievedAt?: string;
 }
 
@@ -23,7 +23,7 @@ export function cairoDateKey(timestamp: string): string {
   if (Number.isNaN(date.getTime())) return '';
 
   const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Africa/Cairo',
+    timeZone: INTRADAY_POLICY.timeZone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -95,7 +95,7 @@ export function rowsToIntradayPriceSeries(
       close,
       volume: Number.isFinite(volume) ? volume : undefined,
       source:
-        row.source === 'tradingview' || row.source === 'yahoo' || row.source === 'other'
+        row.source === 'tradingview' || row.source === 'derived-1m' || row.source === 'yahoo' || row.source === 'other'
           ? row.source
           : undefined,
       retrievedAt: row.retrieved_at == null ? undefined : String(row.retrieved_at),
@@ -118,6 +118,7 @@ export async function getIntradayPrices(
   const normalized = [...new Set(tickers.map(normalizeIntradayTicker).filter(Boolean))];
   if (!normalized.length) return {};
 
+  const { loadIntradayPricesFromSupabase } = await import('./supabasePersistence');
   const rows = await loadIntradayPricesFromSupabase(
     normalized,
     startTimestamp,
